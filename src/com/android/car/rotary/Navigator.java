@@ -16,7 +16,7 @@
 package com.android.car.rotary;
 
 import android.graphics.Rect;
-import android.util.Log;
+import android.os.SystemClock;
 import android.view.View;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
@@ -25,6 +25,8 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 
+import com.android.car.ui.FocusParkingView;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -32,18 +34,36 @@ import java.util.List;
  * A helper class used for finding the next focusable node when the rotary controller is rotated or
  * nudged.
  */
-class NavigationHelper {
-    private static final String TAG = "NavigationHelper";
-    private static final boolean DEBUG = false;
-
+class Navigator {
     @NonNull
     private static Utils sUtils = Utils.getInstance();
 
-    /** How many levels in the node tree to scan for focus areas. */
-    private int mFocusAreaMaxDepth;
+    private final RotaryCache mRotaryCache;
 
-    NavigationHelper(int focusAreaMaxDepth) {
-        mFocusAreaMaxDepth = focusAreaMaxDepth;
+    Navigator(@RotaryCache.CacheType int focusHistoryCacheType,
+            int focusHistoryCacheSize,
+            int focusHistoryExpirationTimeMs,
+            @RotaryCache.CacheType int focusAreaHistoryCacheType,
+            int focusAreaHistoryCacheSize,
+            int focusAreaHistoryExpirationTimeMs) {
+        mRotaryCache = new RotaryCache(focusHistoryCacheType,
+                focusHistoryCacheSize,
+                focusHistoryExpirationTimeMs,
+                focusAreaHistoryCacheType,
+                focusAreaHistoryCacheSize,
+                focusAreaHistoryExpirationTimeMs);
+    }
+
+    /** Clears focus area history cache. */
+    void clearFocusAreaHistory() {
+        mRotaryCache.clearFocusAreaHistory();
+    }
+
+    /** Caches the focused node by focus area. */
+    void saveFocusedNode(@NonNull AccessibilityNodeInfo focusedNode) {
+        AccessibilityNodeInfo focusArea = getAncestorFocusArea(focusedNode);
+        mRotaryCache.saveFocusedNode(focusArea, focusedNode, SystemClock.elapsedRealtime());
+        Utils.recycleNode(focusArea);
     }
 
     /**
@@ -65,6 +85,14 @@ class NavigationHelper {
         Utils.recycleNode(currentFocusArea);
         if (targetFocusArea == null) {
             return null;
+        }
+
+        // Return the recently focused node within the target focus area, if any.
+        AccessibilityNodeInfo cachedFocusedNode =
+                mRotaryCache.getFocusedNode(targetFocusArea, SystemClock.elapsedRealtime());
+        if (cachedFocusedNode != null) {
+            Utils.recycleNode(targetFocusArea);
+            return cachedFocusedNode;
         }
 
         // Make a list of candidate nodes in the target FocusArea.
@@ -129,21 +157,111 @@ class NavigationHelper {
      * not found. The caller is responsible for recycling the result.
      */
     static AccessibilityNodeInfo findFirstFocusDescendant(@NonNull AccessibilityNodeInfo rootNode) {
-        AccessibilityNodeInfo focusArea = findFirstFocusArea(rootNode);
-        if (focusArea == null) {
-            loge("No FocusArea in the tree");
-            return null;
+        // First try finding the first focus area and searching forward from the focus area. This
+        // is a quick way to find the first node but it doesn't always work.
+        AccessibilityNodeInfo focusDescendant = findFirstFocus(rootNode);
+        if (focusDescendant != null) {
+            return focusDescendant;
         }
-        AccessibilityNodeInfo focusDescendant = findFirstFocus(focusArea);
-        focusArea.recycle();
+
+        // Fall back to tree traversal.
+        L.w("Falling back to tree traversal");
+        focusDescendant = findDepthFirstFocus(rootNode);
+        if (focusDescendant == null) {
+            L.w("No node can take focus in the current window");
+        }
         return focusDescendant;
+    }
+
+    /** Returns whether the given {@code node} represents a {@link FocusParkingView}. */
+    static boolean isFocusParkingView(@NonNull AccessibilityNodeInfo node) {
+        CharSequence className = node.getClassName();
+        return className != null && FocusParkingView.class.getName().contentEquals(className);
     }
 
     /** Sets a mock Utils instance for testing. */
     @VisibleForTesting
     static void setUtils(@NonNull Utils utils) {
         sUtils = utils;
-        // TODO(b/151349253): RotaryCache.setUtils(utils);
+        RotaryCache.setUtils(utils);
+    }
+
+    /**
+     * Searches all the nodes in the {@code window}, and returns the node representing a {@link
+     * FocusParkingView}, if any, or returns null if not found. The caller is responsible for
+     * recycling the result.
+     */
+    static AccessibilityNodeInfo findFocusParkingView(@NonNull AccessibilityWindowInfo window) {
+        AccessibilityNodeInfo root = window.getRoot();
+        if (root == null) {
+            L.e("No root node in " + window);
+            return null;
+        }
+        AccessibilityNodeInfo focusParkingView = findFocusParkingView(root);
+        root.recycle();
+        return focusParkingView;
+    }
+
+    /**
+     * Searches the {@code node} and its descendants in depth-first order, and returns the node
+     * representing a {@link FocusParkingView}, if any, or returns null if not found. The caller is
+     * responsible for recycling the result.
+     */
+    private static AccessibilityNodeInfo findFocusParkingView(@NonNull AccessibilityNodeInfo node) {
+        if (isFocusParkingView(node)) {
+            return copyNode(node);
+        }
+        // No need to search in focus areas because FocusParkingViews are outside of focus areas.
+        if (isFocusArea(node)) {
+            return null;
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            AccessibilityNodeInfo focusParkingView = findFocusParkingView(child);
+            child.recycle();
+            if (focusParkingView != null) {
+                return focusParkingView;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Searches the {@code rootNode} and its descendants in depth-first order for the first focus
+     * area, and returns the first node that can take focus in tab order from the focus area.
+     * The return value could be a node inside or outside the first focus area, or null if not
+     * found. The caller is responsible for recycling result.
+     */
+    private static AccessibilityNodeInfo findFirstFocus(@NonNull AccessibilityNodeInfo rootNode) {
+        AccessibilityNodeInfo focusArea = findFirstFocusArea(rootNode);
+        if (focusArea == null) {
+            L.e("No FocusArea in the tree");
+            return null;
+        }
+
+        AccessibilityNodeInfo targetNode = focusArea.focusSearch(View.FOCUS_FORWARD);
+        AccessibilityNodeInfo firstTarget = copyNode(targetNode);
+        // focusSearch() searches in the active window, which has at least one FocusParkingView. We
+        // need to skip it.
+        while (targetNode != null && isFocusParkingView(targetNode)) {
+            L.d("Found FocusParkingView, continue focusSearch() ...");
+            AccessibilityNodeInfo nextTargetNode = targetNode.focusSearch(View.FOCUS_FORWARD);
+            targetNode.recycle();
+            targetNode = nextTargetNode;
+
+            // If we found the same FocusParkingView again, it means all the focusable views in
+            // current window are FocusParkingViews, so we should just return null.
+            if (firstTarget.equals(targetNode)) {
+                L.w("Stop focusSearch() because there is no view to take focus except "
+                        + "FocusParkingViews");
+                Utils.recycleNode(targetNode);
+                targetNode = null;
+                break;
+            }
+        }
+        Utils.recycleNode(firstTarget);
+        focusArea.recycle();
+        return targetNode;
     }
 
     /**
@@ -166,29 +284,6 @@ class NavigationHelper {
             }
         }
         return null;
-    }
-
-    /**
-     * Returns the first node that can take focus in tab order inside the given {@code focusArea}.
-     * The caller is responsible for recycling result.
-     */
-    private static AccessibilityNodeInfo findFirstFocus(@NonNull AccessibilityNodeInfo focusArea) {
-        // First try searching forward from the focus area. This is a quick way to find the first
-        // node within the focus area but it doesn't always work.
-        AccessibilityNodeInfo targetNode = focusArea.focusSearch(View.FOCUS_FORWARD);
-        if (targetNode != null) {
-            AccessibilityNodeInfo ancestorFocusArea = getAncestorFocusArea(targetNode);
-            boolean isTargetInFocusArea = focusArea.equals(ancestorFocusArea);
-            Utils.recycleNode(ancestorFocusArea);
-            if (isTargetInFocusArea) {
-                return targetNode;
-            }
-        }
-        Utils.recycleNode(targetNode);
-
-        // Fall back to tree traversal.
-        logw("Falling back to tree traversal");
-        return findDepthFirstFocus(focusArea);
     }
 
     /**
@@ -220,9 +315,22 @@ class NavigationHelper {
             @NonNull AccessibilityNodeInfo focusedNode,
             @NonNull AccessibilityNodeInfo currentFocusArea,
             int direction) {
+        long elapsedRealtime = SystemClock.elapsedRealtime();
+        // If there is a target focus area in the cache, returns it.
+        AccessibilityNodeInfo cachedTargetFocusArea =
+                mRotaryCache.getTargetFocusArea(currentFocusArea, direction, elapsedRealtime);
+        if (cachedTargetFocusArea != null) {
+            // We already got nudge history in the cache. Before nudging back, let's save "nudge
+            // back" history.
+            mRotaryCache.saveTargetFocusArea(
+                    currentFocusArea, cachedTargetFocusArea, direction, elapsedRealtime);
+            return cachedTargetFocusArea;
+        }
+
+        // No target focus area in the cache; we need to search the node tree to find it.
         AccessibilityWindowInfo currentWindow = focusedNode.getWindow();
         if (currentWindow == null) {
-            loge("Currently focused window is null");
+            L.e("Currently focused window is null");
             return null;
         }
 
@@ -250,6 +358,12 @@ class NavigationHelper {
         AccessibilityNodeInfo targetFocusArea =
                 chooseBestNudgeCandidate(focusedNode, candidateFocusAreas, direction);
         Utils.recycleNodes(candidateFocusAreas);
+
+        if (targetFocusArea != null) {
+            // Save nudge history.
+            mRotaryCache.saveTargetFocusArea(
+                    currentFocusArea, targetFocusArea, direction, elapsedRealtime);
+        }
 
         return targetFocusArea;
     }
@@ -280,8 +394,8 @@ class NavigationHelper {
 
     /**
      * Scans the view hierarchy of the given {@code window} looking for focus areas and returns
-     * them. If there are no explicitly declared {@link FocusArea}s in the top {@link
-     * #mFocusAreaMaxDepth}, returns the root view. The caller is responsible for recycling the
+     * them. If there are no explicitly declared {@link FocusArea}s, returns the root view. The
+     * caller is responsible for recycling the
      * result.
      */
     private @NonNull
@@ -289,7 +403,7 @@ class NavigationHelper {
         List<AccessibilityNodeInfo> results = new ArrayList<>();
         AccessibilityNodeInfo rootNode = window.getRoot();
         if (rootNode != null) {
-            addFocusAreas(rootNode, results, mFocusAreaMaxDepth);
+            addFocusAreas(rootNode, results);
             if (results.isEmpty()) {
                 results.add(copyNode(rootNode));
             }
@@ -305,18 +419,16 @@ class NavigationHelper {
      *
      * @param rootNode the root to start scanning from
      * @param results  a list of focus areas to add to
-     * @param maxDepth how many levels to search
      */
     private static void addFocusAreas(@NonNull AccessibilityNodeInfo rootNode,
-            @NonNull List<AccessibilityNodeInfo> results,
-            int maxDepth) {
+            @NonNull List<AccessibilityNodeInfo> results) {
         if (isFocusArea(rootNode)) {
             results.add(copyNode(rootNode));
-        } else if (maxDepth > 1) {
+        } else {
             for (int i = 0; i < rootNode.getChildCount(); i++) {
                 AccessibilityNodeInfo childNode = rootNode.getChild(i);
                 if (childNode != null) {
-                    addFocusAreas(childNode, results, maxDepth - 1);
+                    addFocusAreas(childNode, results);
                     childNode.recycle();
                 }
             }
@@ -343,7 +455,8 @@ class NavigationHelper {
     private static boolean canTakeFocus(@NonNull AccessibilityNodeInfo node) {
         // TODO(b/151458195): remove "!isFocusArea(node)" once FocusArea is not focusable.
         return node.isVisibleToUser() && node.isFocusable() && node.isEnabled()
-                && !isFocusArea(node);
+                && !isFocusArea(node)
+                && !isFocusParkingView(node);
     }
 
     /**
@@ -396,7 +509,7 @@ class NavigationHelper {
         }
         AccessibilityNodeInfo parentNode = node.getParent();
         if (parentNode == null) {
-            logw("Couldn't find ancestor focus area for given node: " + node);
+            L.w("Couldn't find ancestor focus area for given node: " + node);
             return copyNode(node);
         }
         AccessibilityNodeInfo result = getAncestorFocusArea(parentNode);
@@ -410,17 +523,5 @@ class NavigationHelper {
         // TODO(b/151458195): return FocusArea.class.getName().contentEquals(className);
         String focusArea = "com.android.car.ui.FocusArea";
         return focusArea.contentEquals(className);
-    }
-
-    private static void loge(String str) {
-        if (DEBUG) {
-            Log.e(TAG, str);
-        }
-    }
-
-    private static void logw(String str) {
-        if (DEBUG) {
-            Log.w(TAG, str);
-        }
     }
 }
