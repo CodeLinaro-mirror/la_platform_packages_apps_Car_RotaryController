@@ -15,8 +15,13 @@
  */
 package com.android.car.rotary;
 
+import android.accessibilityservice.AccessibilityService;
+import android.accessibilityservice.AccessibilityServiceInfo;
+import android.car.Car;
+import android.car.input.CarInputManager;
+import android.car.input.RotaryEvent;
+import android.os.Build;
 import android.os.SystemClock;
-import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.accessibility.AccessibilityEvent;
@@ -26,32 +31,55 @@ import android.view.accessibility.AccessibilityWindowInfo;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import com.android.car.ui.utils.DirectManipulationHelper;
+
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * An accessibility service that can change focus based on rotary controller rotation and nudges.
- *
- * This service responds to {@link KeyEvent}s and {@link AccessibilityEvent}s. {@link KeyEvent}s
- * coming from the rotary controller are handled by moving the focus, sometimes within a window and
- * sometimes between windows. This service listens to two types of {@link AccessibilityEvent}s:
- * {@link AccessibilityEvent#TYPE_VIEW_FOCUSED} and {@link AccessibilityEvent#TYPE_VIEW_CLICKED}.
- * The former is used to keep {@link #mFocusedNode} up to date as the focus changes. The latter is
- * used to detect when the user switches from rotary mode to touch mode and to keep {@link
+ * A service that can change focus based on rotary controller rotation and nudges, and perform
+ * clicks based on rotary controller center button clicks.
+ * <p>
+ * As an {@link AccessibilityService}, this service responds to {@link KeyEvent}s (on debug builds
+ * only) and {@link AccessibilityEvent}s.
+ * <p>
+ * On debug builds, {@link KeyEvent}s coming from the keyboard are handled by clicking the view, or
+ * moving the focus, sometimes within a window and sometimes between windows.
+ * <p>
+ * This service listens to two types of {@link AccessibilityEvent}s: {@link
+ * AccessibilityEvent#TYPE_VIEW_FOCUSED} and {@link AccessibilityEvent#TYPE_VIEW_CLICKED}. The
+ * former is used to keep {@link #mFocusedNode} up to date as the focus changes. The latter is used
+ * to detect when the user switches from rotary mode to touch mode and to keep {@link
  * #mLastTouchedNode} up to date.
- *
+ * <p>
+ * As a {@link CarInputManager.CarInputCaptureCallback}, this service responds to {@link KeyEvent}s
+ * and {@link RotaryEvent}s, both of which are coming from the controller.
+ * <p>
+ * {@link KeyEvent}s are handled by clicking the view, or moving the focus, sometimes within a
+ * window and sometimes between windows.
+ * <p>
+ * {@link RotaryEvent}s are handled by moving the focus within the same {@link FocusArea}.
+ * <p>
  * Note: onFoo methods are all called on the main thread so no locks are needed.
  */
-public class RotaryService extends RotaryServiceBase {
-    private static final String TAG = "RotaryService";
-    private static final boolean DEBUG = true;
+public class RotaryService extends AccessibilityService implements
+        CarInputManager.CarInputCaptureCallback {
 
     @NonNull
     private static Utils sUtils = Utils.getInstance();
 
-    private NavigationHelper mNavigationHelper;
+    private Navigator mNavigator;
+
+    /** Input types to capture. */
+    private final int[] mInputTypes = new int[]{
+            // Capture controller rotation.
+            CarInputManager.INPUT_TYPE_ROTARY_NAVIGATION,
+            // Capture controller center button clicks.
+            CarInputManager.INPUT_TYPE_DPAD_KEYS,
+            // Capture controller nudges.
+            CarInputManager.INPUT_TYPE_SYSTEM_NAVIGATE_KEYS};
 
     /**
      * Time interval in milliseconds to decide whether we should accelerate the rotation by 3 times
@@ -64,6 +92,9 @@ public class RotaryService extends RotaryServiceBase {
      * for a rotate event.
      */
     private int mRotationAcceleration2xMs;
+
+    /** Whether to clear focus area history when the user rotates the controller. */
+    private boolean mClearFocusAreaHistoryWhenRotating;
 
     /** The currently focused node, if any. */
     private AccessibilityNodeInfo mFocusedNode = null;
@@ -82,6 +113,9 @@ public class RotaryService extends RotaryServiceBase {
     /** Whether we're in rotary mode (vs touch mode). */
     private boolean mInRotaryMode;
 
+    /** Whether we're in direct manipulation mode. */
+    private boolean mInDirectManipulationMode;
+
     /** The {@link SystemClock#uptimeMillis} when the last rotary rotation event occurred. */
     private long mLastRotateEventTime;
 
@@ -95,16 +129,19 @@ public class RotaryService extends RotaryServiceBase {
 
     static {
         Map<Integer, Integer> map = new HashMap<>();
-        map.put(KeyEvent.KEYCODE_C, KeyEvent.KEYCODE_NAVIGATE_PREVIOUS);
-        map.put(KeyEvent.KEYCODE_V, KeyEvent.KEYCODE_NAVIGATE_NEXT);
         map.put(KeyEvent.KEYCODE_J, KeyEvent.KEYCODE_SYSTEM_NAVIGATION_LEFT);
         map.put(KeyEvent.KEYCODE_L, KeyEvent.KEYCODE_SYSTEM_NAVIGATION_RIGHT);
         map.put(KeyEvent.KEYCODE_I, KeyEvent.KEYCODE_SYSTEM_NAVIGATION_UP);
         map.put(KeyEvent.KEYCODE_K, KeyEvent.KEYCODE_SYSTEM_NAVIGATION_DOWN);
-        map.put(KeyEvent.KEYCODE_COMMA, KeyEvent.KEYCODE_NAVIGATE_IN);
+        map.put(KeyEvent.KEYCODE_COMMA, KeyEvent.KEYCODE_DPAD_CENTER);
 
         TEST_TO_REAL_KEYCODE_MAP = Collections.unmodifiableMap(map);
     }
+
+    private Car mCar;
+    private CarInputManager mCarInputManager;
+
+    private DirectManipulationHelper mDirectManipulationHelper;
 
     @Override
     public void onCreate() {
@@ -114,19 +151,66 @@ public class RotaryService extends RotaryServiceBase {
         mRotationAcceleration2xMs =
                 getResources().getInteger(R.integer.rotation_acceleration_2x_ms);
 
-        int focusAreaMaxDepth = getResources().getInteger(R.integer.focus_area_max_depth);
-        mNavigationHelper = new NavigationHelper(focusAreaMaxDepth);
+        mClearFocusAreaHistoryWhenRotating =
+                getResources().getBoolean(R.bool.clear_focus_area_history_when_rotating);
+
+        @RotaryCache.CacheType int focusHistoryCacheType =
+                getResources().getInteger(R.integer.focus_history_cache_type);
+        int focusHistoryCacheSize =
+                getResources().getInteger(R.integer.focus_history_cache_size);
+        int focusHistoryExpirationTimeMs =
+                getResources().getInteger(R.integer.focus_history_expiration_time_ms);
+
+        @RotaryCache.CacheType int focusAreaHistoryCacheType =
+                getResources().getInteger(R.integer.focus_area_history_cache_type);
+        int focusAreaHistoryCacheSize =
+                getResources().getInteger(R.integer.focus_area_history_cache_size);
+        int focusAreaHistoryExpirationTimeMs =
+                getResources().getInteger(R.integer.focus_area_history_expiration_time_ms);
+
+        mNavigator = new Navigator(
+                focusHistoryCacheType,
+                focusHistoryCacheSize,
+                focusHistoryExpirationTimeMs,
+                focusAreaHistoryCacheType,
+                focusAreaHistoryCacheSize,
+                focusAreaHistoryExpirationTimeMs);
+
+        mDirectManipulationHelper = new DirectManipulationHelper(this);
+    }
+
+    @Override
+    public void onServiceConnected() {
+        super.onServiceConnected();
+
+        mCar = Car.createCar(this, null, Car.CAR_WAIT_TIMEOUT_WAIT_FOREVER,
+                (car, ready) -> {
+                    mCar = car;
+                    if (ready) {
+                        mCarInputManager =
+                                (CarInputManager) mCar.getCarManager(Car.CAR_INPUT_SERVICE);
+                        mCarInputManager.requestInputEventCapture(this,
+                                CarInputManager.TARGET_DISPLAY_TYPE_MAIN,
+                                mInputTypes,
+                                CarInputManager.CAPTURE_REQ_FLAGS_ALLOW_DELAYED_GRANT);
+                    }
+                });
+
+        if (Build.IS_DEBUGGABLE) {
+            AccessibilityServiceInfo serviceInfo = getServiceInfo();
+            // Filter testing KeyEvents from a keyboard.
+            serviceInfo.flags |= AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
+            setServiceInfo(serviceInfo);
+        }
     }
 
     @Override
     public void onInterrupt() {
-        logv("onInterrupt()");
+        L.v("onInterrupt()");
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        super.onAccessibilityEvent(event);
-
         switch (event.getEventType()) {
             case AccessibilityEvent.TYPE_VIEW_FOCUSED: {
                 if (mInRotaryMode) {
@@ -136,10 +220,10 @@ public class RotaryService extends RotaryServiceBase {
                     // events to keep mFocusedNode up to date and to clear the focus when moving
                     // between windows.
                     AccessibilityNodeInfo sourceNode = event.getSource();
-                    if (sourceNode != null && !sourceNode.equals(mFocusedNode)) {
+                    if (sourceNode != null && !sourceNode.equals(mFocusedNode)
+                            && !Navigator.isFocusParkingView(sourceNode)) {
                         // Android doesn't clear focus automatically when focus is set in another
                         // window.
-                        // TODO(b/152244654): remove this workaround once it's fixed.
                         maybeClearFocusInCurrentWindow(sourceNode);
                         setFocusedNode(sourceNode);
                     }
@@ -169,53 +253,100 @@ public class RotaryService extends RotaryServiceBase {
                 }
                 break;
             }
+            case AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED: {
+                updateDirectManipulationMode(event, true);
+                break;
+            }
+            case AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED: {
+                updateDirectManipulationMode(event, false);
+                break;
+            }
             default:
                 // Do nothing.
+        }
+    }
+
+    /**
+     * Callback of {@link AccessibilityService}. It allows us to observe testing {@link KeyEvent}s
+     * from keyboard, including keys "C" and "V" to emulate controller rotation, keys "J" "L" "I"
+     * "K" to emulate controller nudges, and key "Comma" to emulate center button clicks.
+     */
+    @Override
+    protected boolean onKeyEvent(KeyEvent event) {
+        if (Build.IS_DEBUGGABLE) {
+            return handleKeyEvent(event);
+        }
+        return false;
+    }
+
+    /**
+     * Callback of {@link CarInputManager.CarInputCaptureCallback}. It allows us to capture {@link
+     * KeyEvent}s generated by a navigation controller, such as controller nudge and controller
+     * click events.
+     */
+    @Override
+    public void onKeyEvents(int targetDisplayId, List<KeyEvent> events) {
+        if (!isValidDisplayId(targetDisplayId)) {
+            return;
+        }
+        for (KeyEvent event : events) {
+            handleKeyEvent(event);
+        }
+    }
+
+    /**
+     * Callback of {@link CarInputManager.CarInputCaptureCallback}. It allows us to capture {@link
+     * RotaryEvent}s generated by a navigation controller.
+     */
+    @Override
+    public void onRotaryEvents(int targetDisplayId, List<RotaryEvent> events) {
+        if (!isValidDisplayId(targetDisplayId)) {
+            return;
+        }
+        for (RotaryEvent rotaryEvent : events) {
+            handleRotaryEvent(rotaryEvent);
         }
     }
 
     @Override
-    protected boolean onKeyEvent(KeyEvent event) {
+    public void onCaptureStateChanged(int targetDisplayId,
+            @android.annotation.NonNull @CarInputManager.InputTypeEnum int[] activeInputTypes) {
+        // Do nothing.
+    }
+
+    private boolean isValidDisplayId(int displayId) {
+        if (displayId == CarInputManager.TARGET_DISPLAY_TYPE_MAIN) {
+            return true;
+        }
+        L.e("RotaryService shouldn't capture events from display ID " + displayId);
+        return false;
+    }
+
+    /** Handles key events. Returns whether the key event was handled. */
+    private boolean handleKeyEvent(KeyEvent event) {
         int action = event.getAction();
         switch (action) {
             case KeyEvent.ACTION_DOWN: {
-                if (handleKeyDownEvent(event)) {
-                    return true;
-                }
-                break;
+                return handleKeyDownEvent(event);
             }
             case KeyEvent.ACTION_UP: {
-                int keyCode = event.getKeyCode();
-                if (keyCode == KeyEvent.KEYCODE_NAVIGATE_IN) {
-                    if (mClickRepeatCount == 0) {
-                        // TODO: handleClickEvent();
-                    }
-                }
-                break;
+                return handleKeyUpEvent(event);
             }
             default:
                 // Do nothing.
         }
-        return super.onKeyEvent(event);
+        return false;
     }
 
     /** Handles key down events. Returns whether the key event was handled. */
     private boolean handleKeyDownEvent(KeyEvent event) {
-        int keyCode = event.getKeyCode();
-
-        // TODO(b/152630987): enable this on userdebug builds.
-        if (DEBUG) {
-            Integer mappingKeyCode = TEST_TO_REAL_KEYCODE_MAP.get(keyCode);
-            if (mappingKeyCode != null) {
-                keyCode = mappingKeyCode;
-            }
-        }
+        int keyCode = getKeyCode(event);
         switch (keyCode) {
-            case KeyEvent.KEYCODE_NAVIGATE_PREVIOUS:
+            case KeyEvent.KEYCODE_C:
                 handleRotateEvent(View.FOCUS_BACKWARD, event.getRepeatCount(),
                         event.getEventTime());
                 return true;
-            case KeyEvent.KEYCODE_NAVIGATE_NEXT:
+            case KeyEvent.KEYCODE_V:
                 handleRotateEvent(View.FOCUS_FORWARD, event.getRepeatCount(), event.getEventTime());
                 return true;
             case KeyEvent.KEYCODE_SYSTEM_NAVIGATION_LEFT:
@@ -238,8 +369,50 @@ public class RotaryService extends RotaryServiceBase {
                 return true;
             default:
                 // Do nothing
-                return false;
         }
+        return false;
+    }
+
+    /** Handles key up events. Returns whether the event was handled. */
+    private boolean handleKeyUpEvent(KeyEvent event) {
+        int keyCode = getKeyCode(event);
+        if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER) {
+            if (mClickRepeatCount == 0) {
+                handleClickEvent();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static int getKeyCode(KeyEvent event) {
+        int keyCode = event.getKeyCode();
+        if (Build.IS_DEBUGGABLE) {
+            Integer mappingKeyCode = TEST_TO_REAL_KEYCODE_MAP.get(keyCode);
+            if (mappingKeyCode != null) {
+                keyCode = mappingKeyCode;
+            }
+        }
+        return keyCode;
+    }
+
+    /** Handles click event. */
+    private void handleClickEvent() {
+        if (initFocus()) {
+            return;
+        }
+        // If the focus is in the application window, inject click event and the application will
+        // handle it.
+        if (isFocusInApplicationWindow()) {
+            // TODO(b/153888670): inject KeyEvent.KEYCODE_DPAD_CENTER event.
+            return;
+        }
+
+        boolean result = mFocusedNode.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        if (!result) {
+            L.w("Failed to perform ACTION_CLICK on " + mFocusedNode);
+        }
+        mRotaryClicked = true;
     }
 
     private void handleNudgeEvent(int direction) {
@@ -249,37 +422,74 @@ public class RotaryService extends RotaryServiceBase {
         // TODO(b/152438801): sometimes getWindows() takes 10s after boot.
         List<AccessibilityWindowInfo> windows = getWindows();
         AccessibilityNodeInfo targetNode =
-                mNavigationHelper.findNudgeTarget(windows, mFocusedNode, direction);
+                mNavigator.findNudgeTarget(windows, mFocusedNode, direction);
         Utils.recycleWindows(windows);
         if (targetNode == null) {
-            logw("Failed to find nudge target");
+            L.w("Failed to find nudge target");
             return;
         }
 
         // Android doesn't clear focus automatically when focus is set in another window.
-        // TODO(b/152244654): remove this workaround once it's fixed.
         maybeClearFocusInCurrentWindow(targetNode);
 
         performFocusAction(targetNode);
         Utils.recycleNode(targetNode);
     }
 
+    private void handleRotaryEvent(RotaryEvent rotaryEvent) {
+        if (rotaryEvent.getInputType() != CarInputManager.INPUT_TYPE_ROTARY_NAVIGATION) {
+            return;
+        }
+        int direction = rotaryEvent.isClockwise() ? View.FOCUS_FORWARD : View.FOCUS_BACKWARD;
+        int count = rotaryEvent.getNumberOfClicks();
+        // TODO(b/153195148): Use the first eventTime for now. We'll need to improve it later.
+        long eventTime = rotaryEvent.getUptimeMillisForClick(0);
+        handleRotateEvent(direction, count, eventTime);
+    }
+
     private void handleRotateEvent(int direction, int count, long eventTime) {
-        // TODO(b/151349253): Clear the focus area nudge history when the user rotates.
-        // mNavigationHelper.clearFocusAreaHistory();
+        if (mClearFocusAreaHistoryWhenRotating) {
+            mNavigator.clearFocusAreaHistory();
+        }
 
         if (initFocus()) {
             return;
         }
         int rotationCount = getRotateAcceleration(count, eventTime);
         AccessibilityNodeInfo targetNode =
-                mNavigationHelper.findRotateTarget(mFocusedNode, direction, rotationCount);
+                mNavigator.findRotateTarget(mFocusedNode, direction, rotationCount);
         if (targetNode == null) {
-            logw("Failed to find rotate target");
+            L.w("Failed to find rotate target");
             return;
         }
         performFocusAction(targetNode);
         Utils.recycleNode(targetNode);
+    }
+
+    /** Returns whether the focused node is in Application widow. */
+    private boolean isFocusInApplicationWindow() {
+        if (mFocusedNode == null) {
+            return false;
+        }
+        AccessibilityWindowInfo window = mFocusedNode.getWindow();
+        boolean result = window.getType() == AccessibilityWindowInfo.TYPE_APPLICATION;
+        Utils.recycleWindow(window);
+        return result;
+    }
+
+    private void updateDirectManipulationMode(AccessibilityEvent event, boolean enable) {
+        if (!mInRotaryMode || !mDirectManipulationHelper.isDirectManipulation(event)) {
+            return;
+        }
+        AccessibilityNodeInfo sourceNode = event.getSource();
+        if (sourceNode != null && sourceNode.equals(mFocusedNode)) {
+            if (mInDirectManipulationMode != enable) {
+                // Toggle direct manipulation mode upon app's request.
+                mInDirectManipulationMode = enable;
+                L.d((enable ? "Enter" : "Exit") + " direct manipulation mode upon app's request");
+            }
+        }
+        Utils.recycleNode(sourceNode);
     }
 
     /**
@@ -315,18 +525,40 @@ public class RotaryService extends RotaryServiceBase {
         return true;
     }
 
-    /** Clears the current focus if {@code targetNode} is in a different window. */
-    private void maybeClearFocusInCurrentWindow(@NonNull AccessibilityNodeInfo targetNode) {
+    /**
+     * Clears the current rotary focus if {@code targetFocus} is in a different window.
+     * If we really clear focus in the current window, Android will re-focus a view in the current
+     * window automatically, resulting in the current window and the target window being focused
+     * simultaneously. To avoid that we don't really clear the focus. Instead, we "park" the focus
+     * on a FocusParkingView in the current window. FocusParkingView is transparent no matter
+     * whether it's focused or not, so it's invisible to the user.
+     */
+    private void maybeClearFocusInCurrentWindow(@NonNull AccessibilityNodeInfo targetFocus) {
         if (mFocusedNode == null || !mFocusedNode.isFocused()
-                || mFocusedNode.getWindowId() == targetNode.getWindowId()) {
+                || mFocusedNode.getWindowId() == targetFocus.getWindowId()) {
             return;
         }
-        boolean result = mFocusedNode.performAction(AccessibilityNodeInfo.ACTION_CLEAR_FOCUS);
+
+        AccessibilityWindowInfo window = mFocusedNode.getWindow();
+        if (window == null) {
+            L.e("Failed to get window of " + mFocusedNode);
+            return;
+        }
+        AccessibilityNodeInfo focusParkingView = Navigator.findFocusParkingView(window);
+        window.recycle();
+        if (focusParkingView == null) {
+            L.e("No FocusParkingView in " + window);
+            return;
+        }
+
+        boolean result = focusParkingView.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
         if (result) {
             setFocusedNode(null);
         } else {
-            logw("Failed to perform ACTION_CLEAR_FOCUS");
+            L.w("Failed to perform ACTION_FOCUS on " + focusParkingView);
         }
+
+        focusParkingView.recycle();
     }
 
     /**
@@ -339,7 +571,9 @@ public class RotaryService extends RotaryServiceBase {
         boolean lastTouchedNodeFocused = false;
         if (mLastTouchedNode != null) {
             lastTouchedNodeFocused = performFocusAction(mLastTouchedNode);
-            setLastTouchedNode(null);
+            if (mLastTouchedNode != null) {
+                setLastTouchedNode(null);
+            }
         }
         return lastTouchedNodeFocused;
     }
@@ -351,19 +585,18 @@ public class RotaryService extends RotaryServiceBase {
     private void focusFirstFocusDescendant() {
         AccessibilityNodeInfo rootNode = getRootInActiveWindow();
         if (rootNode == null) {
-            loge("rootNode of active window is null");
+            L.e("rootNode of active window is null");
             return;
         }
-        AccessibilityNodeInfo targetNode = NavigationHelper.findFirstFocusDescendant(rootNode);
+        AccessibilityNodeInfo targetNode = Navigator.findFirstFocusDescendant(rootNode);
         rootNode.recycle();
         if (targetNode == null) {
-            logw("Failed to find the first focus descendant");
+            L.w("Failed to find the first focus descendant");
             return;
         }
         performFocusAction(targetNode);
         targetNode.recycle();
     }
-
 
     /**
      * Sets {@link #mFocusedNode} to a copy of the given node, and clears {@link #mLastTouchedNode}.
@@ -376,8 +609,24 @@ public class RotaryService extends RotaryServiceBase {
     }
 
     private void setFocusedNodeInternal(@Nullable AccessibilityNodeInfo focusedNode) {
+        if ((mFocusedNode == null && focusedNode == null) ||
+                (mFocusedNode != null && mFocusedNode.equals(focusedNode))) {
+            L.d("Don't reset mFocusedNode since it stays the same: " + mFocusedNode);
+            return;
+        }
+        if (mInDirectManipulationMode) {
+            // Toggle off direct manipulation mode since the focus has changed.
+            mInDirectManipulationMode = false;
+            L.d("Exit direct manipulation mode since the focus has changed");
+        }
+
         Utils.recycleNode(mFocusedNode);
         mFocusedNode = copyNode(focusedNode);
+
+        // Cache the focused node by focus area.
+        if (mFocusedNode != null) {
+            mNavigator.saveFocusedNode(mFocusedNode);
+        }
     }
 
     /**
@@ -391,6 +640,11 @@ public class RotaryService extends RotaryServiceBase {
     }
 
     private void setLastTouchedNodeInternal(@Nullable AccessibilityNodeInfo lastTouchedNode) {
+        if ((mLastTouchedNode == null && lastTouchedNode == null) ||
+                (mLastTouchedNode != null && mLastTouchedNode.equals(lastTouchedNode))) {
+            L.d("Don't reset mLastTouchedNode since it stays the same: " + mLastTouchedNode);
+        }
+
         Utils.recycleNode(mLastTouchedNode);
         mLastTouchedNode = copyNode(lastTouchedNode);
     }
@@ -406,15 +660,14 @@ public class RotaryService extends RotaryServiceBase {
             return true;
         }
         if (targetNode.isFocused()) {
-            logw("targetNode is already focused.");
-            setFocusedNode(targetNode);
-            return true;
+            // TODO(b/154560076): find out why isFocused() returned true though it's not focused.
+            L.w("targetNode is already focused: " + targetNode);
         }
         boolean result = targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
         if (result) {
             setFocusedNode(targetNode);
         } else {
-            logw("Failed to perform ACTION_FOCUS on node " + targetNode);
+            L.w("Failed to perform ACTION_FOCUS on node " + targetNode);
         }
         return result;
     }
@@ -435,7 +688,7 @@ public class RotaryService extends RotaryServiceBase {
             count = 1;
         }
         int result = count;
-        // TODO(depstein@): This method can be improved once we've plumbed through the VHAL
+        // TODO(b/153195148): This method can be improved once we've plumbed through the VHAL
         //  changes. We'll get timestamps for each detent.
         long delta = (eventTime - mLastRotateEventTime) / count;  // Assume constant speed.
         if (delta <= mRotationAcceleration3xMs) {
@@ -449,23 +702,5 @@ public class RotaryService extends RotaryServiceBase {
 
     private static AccessibilityNodeInfo copyNode(@Nullable AccessibilityNodeInfo node) {
         return sUtils.copyNode(node);
-    }
-
-    private static void loge(String str) {
-        if (DEBUG) {
-            Log.e(TAG, str);
-        }
-    }
-
-    private static void logw(String str) {
-        if (DEBUG) {
-            Log.w(TAG, str);
-        }
-    }
-
-    private static void logv(String str) {
-        if (DEBUG) {
-            Log.d(TAG, str);
-        }
     }
 }
