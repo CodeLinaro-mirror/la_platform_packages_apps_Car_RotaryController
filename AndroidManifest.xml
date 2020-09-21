@@ -26,12 +26,19 @@
     <uses-permission android:name="android.permission.INJECT_EVENTS"
                      android:protectionLevel="signature"/>
 
+    <!-- Allows us to toggle between touch and rotary IME. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"/>
+
+    <!-- Allows us to have an overlay to capture touch events. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+
     <!-- RotaryService needs to be directBootAware so that it can start before the user is unlocked. -->
     <application>
         <service
             android:name=".RotaryService"
             android:directBootAware="true"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="false">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
             </intent-filter>
