@@ -318,66 +318,88 @@ class Navigator {
             @NonNull AccessibilityNodeInfo sourceNode, int direction, int rotationCount) {
         int advancedCount = 0;
         AccessibilityNodeInfo currentFocusArea = getAncestorFocusArea(sourceNode);
-        AccessibilityNodeInfo targetNode = copyNode(sourceNode);
-        for (int i = 0; i < rotationCount; i++) {
-            AccessibilityNodeInfo nextTargetNode = targetNode.focusSearch(direction);
-            AccessibilityNodeInfo targetFocusArea =
-                    nextTargetNode == null ? null : getAncestorFocusArea(nextTargetNode);
+        AccessibilityNodeInfo candidate = copyNode(sourceNode);
+        AccessibilityNodeInfo target = null;
+        while (advancedCount < rotationCount) {
+            AccessibilityNodeInfo nextCandidate = null;
+            AccessibilityNodeInfo webView = findWebViewAncestor(candidate);
+            if (webView != null) {
+                nextCandidate = findNextFocusableInWebView(webView, candidate, direction);
+            }
+            if (nextCandidate == null) {
+                // If we aren't in a WebView or there aren't any more focusable nodes within the
+                // WebView, use focusSearch().
+                nextCandidate = candidate.focusSearch(direction);
+            }
+            AccessibilityNodeInfo candidateFocusArea =
+                    nextCandidate == null ? null : getAncestorFocusArea(nextCandidate);
 
-            // Only advance to nextTargetNode if it's in the same focus area and it isn't a
-            // FocusParkingView. The second condition prevents wrap-around when there is only one
-            // focus area in the window, including when the root node is treated as a focus area.
-            if (nextTargetNode != null && currentFocusArea.equals(targetFocusArea)
-                    && !Utils.isFocusParkingView(nextTargetNode)) {
-                // If nextTargetNode is a scrollable container with descendants that can take focus,
-                // skip it, and search for the next target.
-                if (Utils.isScrollableContainer(nextTargetNode)
-                        && Utils.descendantCanTakeFocus(nextTargetNode)) {
-                    Utils.recycleNode(targetNode);
-                    Utils.recycleNode(targetFocusArea);
-                    targetNode = nextTargetNode;
-                    --i;
+            // Only advance to nextCandidate if:
+            // 1. it's in the same focus area,
+            // 2. and it isn't a FocusParkingView (this is to prevent wrap-around when there is only
+            //    one focus area in the window, including when the root node is treated as a focus
+            //    area),
+            // 3. and nextCandidate is different from candidate (if sourceNode is the first
+            //    focusable node in the window, searching backward will return sourceNode itself).
+            if (nextCandidate != null && currentFocusArea.equals(candidateFocusArea)
+                    && !Utils.isFocusParkingView(nextCandidate)
+                    && !nextCandidate.equals(candidate)) {
+                // We need to skip nextTargetNode if:
+                // 1. it can't perform focus action (focusSearch() may return a node with zero
+                //    width and height),
+                // 2. or it is a scrollable container but it shouldn't be scrolled (i.e., it is not
+                //    scrollable, or its descendants can take focus).
+                //    When we want to focus on its element directly, we'll skip the container. When
+                //    we want to focus on container and scroll it, we won't skip the container.
+                if (!Utils.canPerformFocus(nextCandidate)
+                        || (Utils.isScrollableContainer(nextCandidate)
+                            && (!nextCandidate.isScrollable()
+                                || Utils.descendantCanTakeFocus(nextCandidate)))) {
+                    Utils.recycleNode(candidate);
+                    Utils.recycleNode(candidateFocusArea);
+                    candidate = nextCandidate;
                     continue;
                 }
-                // If we're navigating through a scrolling view that can scroll in the specified
-                // direction and the next view is off-screen, don't advance to it. (We'll scroll
-                // instead.)
-                Rect nextTargetBounds = new Rect();
-                nextTargetNode.getBoundsInScreen(nextTargetBounds);
-                AccessibilityNodeInfo scrollableContainer = findScrollableContainer(targetNode);
+
+                // If we're navigating in a scrollable container that can scroll in the specified
+                // direction and the next candidate is off-screen or there are no more focusable
+                // views within the scrollable container, stop navigating so that any remaining
+                // detents are used for scrolling.
+                AccessibilityNodeInfo scrollableContainer = findScrollableContainer(candidate);
                 AccessibilityNodeInfo.AccessibilityAction scrollAction =
                         direction == View.FOCUS_FORWARD
                                 ? ACTION_SCROLL_FORWARD
                                 : ACTION_SCROLL_BACKWARD;
                 if (scrollableContainer != null
-                        && scrollableContainer.getActionList().contains(scrollAction)) {
-                    Rect scrollBounds = new Rect();
-                    scrollableContainer.getBoundsInScreen(scrollBounds);
-                    boolean intersects = nextTargetBounds.intersect(scrollBounds);
-                    if (!intersects) {
-                        Utils.recycleNode(nextTargetNode);
-                        Utils.recycleNode(targetFocusArea);
-                        break;
-                    }
+                        && scrollableContainer.getActionList().contains(scrollAction)
+                        && (!Utils.isDescendant(scrollableContainer, nextCandidate)
+                                || Utils.getBoundsInScreen(nextCandidate).isEmpty())) {
+                    Utils.recycleNode(nextCandidate);
+                    Utils.recycleNode(candidateFocusArea);
+                    break;
                 }
                 Utils.recycleNode(scrollableContainer);
 
-                Utils.recycleNode(targetNode);
-                Utils.recycleNode(targetFocusArea);
-                targetNode = nextTargetNode;
+                Utils.recycleNode(candidate);
+                Utils.recycleNode(candidateFocusArea);
+                candidate = nextCandidate;
+                Utils.recycleNode(target);
+                target = copyNode(candidate);
                 advancedCount++;
             } else {
-                Utils.recycleNode(nextTargetNode);
-                Utils.recycleNode(targetFocusArea);
+                Utils.recycleNode(nextCandidate);
+                Utils.recycleNode(candidateFocusArea);
                 break;
             }
         }
-        Utils.recycleNode(currentFocusArea);
-        if (sourceNode.equals(targetNode)) {
-            targetNode.recycle();
+        currentFocusArea.recycle();
+        candidate.recycle();
+        if (sourceNode.equals(target)) {
+            L.e("Wrap-around on the same node");
+            target.recycle();
             return null;
         }
-        return new FindRotateTargetResult(targetNode, advancedCount);
+        return target == null ? null : new FindRotateTargetResult(target, advancedCount);
     }
 
     /**
@@ -552,15 +574,36 @@ class Navigator {
         return targetFocusArea;
     }
 
-    private static void removeEmptyFocusAreas(@NonNull List<AccessibilityNodeInfo> focusAreas) {
+    private void removeEmptyFocusAreas(@NonNull List<AccessibilityNodeInfo> focusAreas) {
         for (Iterator<AccessibilityNodeInfo> iterator = focusAreas.iterator();
                 iterator.hasNext(); ) {
             AccessibilityNodeInfo focusArea = iterator.next();
-            if (!Utils.canHaveFocus(focusArea)) {
+            if (!Utils.canHaveFocus(focusArea)
+                    && !containsWebViewWithFocusableDescendants(focusArea)) {
                 iterator.remove();
                 focusArea.recycle();
             }
         }
+    }
+
+    private boolean containsWebViewWithFocusableDescendants(@NonNull AccessibilityNodeInfo node) {
+        List<AccessibilityNodeInfo> webViews = new ArrayList<>();
+        mTreeTraverser.depthFirstSelect(node, Utils::isWebView, webViews);
+        if (webViews.isEmpty()) {
+            return false;
+        }
+        boolean hasFocusableDescendant = false;
+        for (AccessibilityNodeInfo webView : webViews) {
+            AccessibilityNodeInfo focusableDescendant = mTreeTraverser.depthFirstSearch(webView,
+                    Utils::canPerformFocus);
+            if (focusableDescendant != null) {
+                hasFocusableDescendant = true;
+                focusableDescendant.recycle();
+                break;
+            }
+        }
+        Utils.recycleNodes(webViews);
+        return hasFocusableDescendant;
     }
 
     /**
@@ -633,58 +676,42 @@ class Navigator {
     }
 
     /**
-     * Returns the previous node in Tab order before {@code referenceNode} within
-     * {@code containerNode} or null if none. The caller is responsible for recycling the result.
-     */
-    @Nullable
-    static AccessibilityNodeInfo findPreviousFocusableDescendant(
-            @NonNull AccessibilityNodeInfo containerNode,
-            @NonNull AccessibilityNodeInfo referenceNode) {
-        return findFocusableDescendantInDirection(containerNode, referenceNode,
-                View.FOCUS_BACKWARD);
-    }
-
-    /**
-     * Returns the next node after {@code referenceNode} in Tab order within {@code containerNode}
-     * or null if none. The caller is responsible for recycling the result.
-     */
-    @Nullable
-    static AccessibilityNodeInfo findNextFocusableDescendant(
-            @NonNull AccessibilityNodeInfo containerNode,
-            @NonNull AccessibilityNodeInfo referenceNode) {
-        return findFocusableDescendantInDirection(containerNode, referenceNode, View.FOCUS_FORWARD);
-    }
-
-    /**
-     * Returns the previous node before {@code referenceNode} in Tab order or the next node after
-     * {@code referenceNode} in Tab order, depending on {@code direction}. The search is limited to
-     * descendants of {@code containerNode}. Returns null if there are no focusable descendants in
-     * the given direction. The caller is responsible for recycling the result.
+     * Returns the previous node  before {@code referenceNode} in Tab order that can take focus or
+     * the next node after {@code referenceNode} in Tab order that can take focus, depending on
+     * {@code direction}. The search is limited to descendants of {@code containerNode}. Returns
+     * null if there are no descendants that can take focus in the given direction. The caller is
+     * responsible for recycling the result.
      *
      * @param containerNode the node with descendants
      * @param referenceNode a descendant of {@code containerNode} to start from
-     * @param direction {@link View#FOCUS_FORWARD} or {@link View#FOCUS_BACKWARD}
+     * @param direction     {@link View#FOCUS_FORWARD} or {@link View#FOCUS_BACKWARD}
      * @return the node before or after {@code referenceNode} or null if none
      */
     @Nullable
-    static AccessibilityNodeInfo findFocusableDescendantInDirection(
+    AccessibilityNodeInfo findFocusableDescendantInDirection(
             @NonNull AccessibilityNodeInfo containerNode,
             @NonNull AccessibilityNodeInfo referenceNode,
             int direction) {
-        AccessibilityNodeInfo targetNode = referenceNode.focusSearch(direction);
-        if (targetNode == null
-                || targetNode.equals(containerNode)
-                || !Utils.canTakeFocus(targetNode)
-                || !Utils.isDescendant(containerNode, targetNode)) {
-            Utils.recycleNode(targetNode);
-            return null;
-        }
-        if (targetNode.equals(referenceNode)) {
-            L.w((direction == View.FOCUS_FORWARD ? "Next" : "Previous")
-                    + " node is the same node: " + referenceNode);
-            Utils.recycleNode(targetNode);
-            return null;
-        }
+        AccessibilityNodeInfo targetNode = copyNode(referenceNode);
+        do {
+            AccessibilityNodeInfo nextTargetNode = targetNode.focusSearch(direction);
+            if (nextTargetNode == null
+                    || nextTargetNode.equals(containerNode)
+                    || !Utils.isDescendant(containerNode, nextTargetNode)) {
+                Utils.recycleNode(nextTargetNode);
+                Utils.recycleNode(targetNode);
+                return null;
+            }
+            if (nextTargetNode.equals(referenceNode) || nextTargetNode.equals(targetNode)) {
+                L.w((direction == View.FOCUS_FORWARD ? "Next" : "Previous")
+                        + " node is the same node: " + referenceNode);
+                Utils.recycleNode(nextTargetNode);
+                Utils.recycleNode(targetNode);
+                return null;
+            }
+            targetNode.recycle();
+            targetNode = nextTargetNode;
+        } while (!Utils.canTakeFocus(targetNode));
         return targetNode;
     }
 
@@ -729,7 +756,21 @@ class Navigator {
      */
     private void addFocusDescendants(@NonNull AccessibilityNodeInfo node,
             @NonNull List<AccessibilityNodeInfo> results) {
-        mTreeTraverser.depthFirstSelect(node, Utils::canTakeFocus, results);
+        // Include off-screen nodes within a WebView.
+        if (Utils.isWebView(node)) {
+            mTreeTraverser.depthFirstSelect(node, Utils::canPerformFocus, results);
+            return;
+        }
+
+        if (Utils.canTakeFocus(node)) {
+            results.add(node);
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                addFocusDescendants(child, results);
+            }
+        }
     }
 
     /**
@@ -748,16 +789,16 @@ class Navigator {
         if (candidates.isEmpty()) {
             return null;
         }
-        Rect sourceBounds = new Rect();
-        sourceNode.getBoundsInScreen(sourceBounds);
-
+        Rect sourceBounds = Utils.getBoundsInScreen(sourceNode);
+        AccessibilityNodeInfo sourceFocusArea = getAncestorFocusArea(sourceNode);
+        Rect sourceFocusAreaBounds = Utils.getBoundsInScreen(sourceFocusArea);
+        sourceFocusArea.recycle();
         AccessibilityNodeInfo bestNode = null;
         Rect bestBounds = new Rect();
 
-        Rect candidateBounds = new Rect();
         for (AccessibilityNodeInfo candidate : candidates) {
-            if (isCandidate(sourceBounds, candidate, direction)) {
-                candidate.getBoundsInScreen(candidateBounds);
+            if (isCandidate(sourceBounds, sourceFocusAreaBounds, candidate, direction)) {
+                Rect candidateBounds = Utils.getBoundsInScreen(candidate);
                 if (bestNode == null || FocusFinder.isBetterCandidate(
                         direction, sourceBounds, candidateBounds, bestBounds)) {
                     bestNode = candidate;
@@ -770,22 +811,49 @@ class Navigator {
 
     /**
      * Returns whether the given {@code node} is a candidate from {@code sourceBounds} to the given
-     * {@code direction}. To be a candidate, the node or one of its descendants must be able to take
-     * focus and must be considered a candidate by {@link FocusFinder#isCandidate}.
+     * {@code direction}.
+     * <p>
+     * To be a candidate, the node
+     * <ul>
+     *     <li>must be considered a candidate by {@link FocusFinder#isCandidate} if it represents a
+     *         focusable view within a focus area
+     *     <li>must be in the {@code direction} of the {@code sourceFocusAreaBounds} and one of its
+     *         focusable descendants must be a candidate if it represents a focus area
+     * </ul>
      */
     private boolean isCandidate(@NonNull Rect sourceBounds,
+            @NonNull Rect sourceFocusAreaBounds,
             @NonNull AccessibilityNodeInfo node,
             int direction) {
-        AccessibilityNodeInfo candidate = mTreeTraverser.depthFirstSearch(node, candidateNode -> {
-            // First check if the node can take focus.
-            if (!Utils.canTakeFocus(candidateNode)) {
-                return false;
-            }
-            // The node represents a focusable view in the FocusArea, so check the geometry.
-            Rect candidateBounds = new Rect();
-            candidateNode.getBoundsInScreen(candidateBounds);
-            return FocusFinder.isCandidate(sourceBounds, candidateBounds, direction);
-        });
+        AccessibilityNodeInfo candidate = mTreeTraverser.depthFirstSearch(node,
+                /* skipPredicate= */ candidateNode -> {
+                    if (Utils.canTakeFocus(candidateNode)) {
+                        return false;
+                    }
+                    // If a node can't take focus, it represents a focus area. If the focus area
+                    // doesn't intersect with sourceFocusAreaBounds, and it's not in the given
+                    // direction of sourceFocusAreaBounds, it's not a candidate, so we should return
+                    // true to stop searching.
+                    Rect candidateBounds = Utils.getBoundsInScreen(candidateNode);
+                    return !Rect.intersects(candidateBounds,sourceFocusAreaBounds)
+                            && !FocusFinder.isInDirection(
+                                sourceFocusAreaBounds, candidateBounds, direction);
+                },
+                /* targetPredicate= */ candidateNode -> {
+                    // RotaryService can navigate to nodes in a WebView even when off-screen so we
+                    // use canPerformFocus() to skip the bounds check.
+                    if (isInWebView(candidateNode)) {
+                        return Utils.canPerformFocus(candidateNode);
+                    }
+                    // If a node can't take focus, it represents a focus area, so we return false to
+                    // skip the node and let it search its descendants.
+                    if (!Utils.canTakeFocus(candidateNode)) {
+                        return false;
+                    }
+                    // The node represents a focusable view in a focus area, so check the geometry.
+                    Rect candidateBounds = Utils.getBoundsInScreen(candidateNode);
+                    return FocusFinder.isCandidate(sourceBounds, candidateBounds, direction);
+                });
         if (candidate == null) {
             return false;
         }
@@ -825,9 +893,111 @@ class Navigator {
         return result;
     }
 
-    /** An interface for a lambda that returns an {@link AccessibilityNodeInfo}. */
-    interface NodeProvider {
-        AccessibilityNodeInfo provideNode();
+    /**
+     * Returns a copy of {@code node} or the nearest ancestor that represents a {@code WebView}.
+     * Returns null if {@code node} isn't a {@code WebView} and isn't a descendant of a {@code
+     * WebView}.
+     */
+    @Nullable
+    private AccessibilityNodeInfo findWebViewAncestor(@NonNull AccessibilityNodeInfo node) {
+        return mTreeTraverser.findNodeOrAncestor(node, Utils::isWebView);
+    }
+
+    /** Returns whether {@code node} is a {@code WebView} or is a descendant of one. */
+    boolean isInWebView(@NonNull AccessibilityNodeInfo node) {
+        AccessibilityNodeInfo webView = findWebViewAncestor(node);
+        if (webView == null) {
+            return false;
+        }
+        webView.recycle();
+        return true;
+    }
+
+    /**
+     * Returns the next focusable node after {@code candidate} in {@code direction} in {@code
+     * webView} or null if none. This handles navigating into a WebView as well as within a WebView.
+     */
+    @Nullable
+    private AccessibilityNodeInfo findNextFocusableInWebView(@NonNull AccessibilityNodeInfo webView,
+            @NonNull AccessibilityNodeInfo candidate, int direction) {
+        // focusSearch() doesn't work in WebViews so use tree traversal instead.
+        if (Utils.isWebView(candidate)) {
+            if (direction == View.FOCUS_FORWARD) {
+                // When entering into a WebView, find the first focusable node within the
+                // WebView if any.
+                return findFirstFocusableDescendantInWebView(candidate);
+            } else {
+                // When backing into a WebView, find the last focusable node within the
+                // WebView if any.
+                return findLastFocusableDescendantInWebView(candidate);
+            }
+        } else {
+            // When navigating within a WebView, find the next or previous focusable node in
+            // depth-first order.
+            if (direction == View.FOCUS_FORWARD) {
+                return findFirstFocusDescendantInWebViewAfter(webView, candidate);
+            } else {
+                return findFirstFocusDescendantInWebViewBefore(webView, candidate);
+            }
+        }
+    }
+
+    /**
+     * Returns the first descendant of {@code webView} which can perform focus. This includes off-
+     * screen descendants. The nodes are searched in in depth-first order, not including
+     * {@code webView} itself. If no descendant can perform focus, null is returned. The caller is
+     * responsible for recycling the result.
+     */
+    @Nullable
+    private AccessibilityNodeInfo findFirstFocusableDescendantInWebView(
+            @NonNull AccessibilityNodeInfo webView) {
+        return mTreeTraverser.depthFirstSearch(webView,
+                candidateNode -> candidateNode != webView && Utils.canPerformFocus(candidateNode));
+    }
+
+    /**
+     * Returns the last descendant of {@code webView} which can perform focus. This includes off-
+     * screen descendants. The nodes are searched in reverse depth-first order, not including
+     * {@code webView} itself. If no descendant can perform focus, null is returned. The caller is
+     * responsible for recycling the result.
+     */
+    @Nullable
+    private AccessibilityNodeInfo findLastFocusableDescendantInWebView(
+            @NonNull AccessibilityNodeInfo webView) {
+        return mTreeTraverser.reverseDepthFirstSearch(webView,
+                candidateNode -> candidateNode != webView && Utils.canPerformFocus(candidateNode));
+    }
+
+    @Nullable
+    private AccessibilityNodeInfo findFirstFocusDescendantInWebViewBefore(
+            @NonNull AccessibilityNodeInfo webView, @NonNull AccessibilityNodeInfo beforeNode) {
+        boolean[] foundBeforeNode = new boolean[1];
+        return mTreeTraverser.reverseDepthFirstSearch(webView,
+                node -> {
+                    if (foundBeforeNode[0] && Utils.canPerformFocus(node)) {
+                        return true;
+                    }
+                    if (node.equals(beforeNode)) {
+                        foundBeforeNode[0] = true;
+                    }
+                    return false;
+                });
+    }
+
+    @Nullable
+    private AccessibilityNodeInfo findFirstFocusDescendantInWebViewAfter(
+            @NonNull AccessibilityNodeInfo webView, @NonNull AccessibilityNodeInfo afterNode) {
+        boolean[] foundAfterNode = new boolean[1];
+        return mTreeTraverser.depthFirstSearch(webView,
+                node -> {
+                    if (foundAfterNode[0] && Utils.canPerformFocus(node)) {
+                        return true;
+                    }
+                    if (node.equals(afterNode)) {
+                        foundAfterNode[0] = true;
+                    }
+                    return false;
+                });
     }
 
     /** Result from {@link #findRotateTarget}. */
