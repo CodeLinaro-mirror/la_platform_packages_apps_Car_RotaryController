@@ -16,8 +16,11 @@
 package com.android.car.rotary;
 
 import static android.accessibilityservice.AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
+import static android.car.CarOccupantZoneManager.DisplayTypeEnum;
 import static android.provider.Settings.Secure.DEFAULT_INPUT_METHOD;
 import static android.view.Display.DEFAULT_DISPLAY;
+import static android.view.KeyEvent.ACTION_DOWN;
+import static android.view.KeyEvent.ACTION_UP;
 import static android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
 import static android.view.WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH;
 import static android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
@@ -30,23 +33,32 @@ import static android.view.accessibility.AccessibilityEvent.TYPE_WINDOWS_CHANGED
 import static android.view.accessibility.AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
 import static android.view.accessibility.AccessibilityEvent.WINDOWS_CHANGE_ADDED;
 import static android.view.accessibility.AccessibilityEvent.WINDOWS_CHANGE_REMOVED;
+import static android.view.accessibility.AccessibilityNodeInfo.ACTION_CLEAR_SELECTION;
 import static android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK;
-import static android.view.accessibility.AccessibilityNodeInfo.ACTION_DISMISS;
 import static android.view.accessibility.AccessibilityNodeInfo.ACTION_FOCUS;
 import static android.view.accessibility.AccessibilityNodeInfo.ACTION_LONG_CLICK;
+import static android.view.accessibility.AccessibilityNodeInfo.ACTION_SELECT;
 import static android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_BACKWARD;
 import static android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_FORWARD;
+import static android.view.accessibility.AccessibilityNodeInfo.FOCUS_INPUT;
 import static android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION;
 import static android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD;
-import static android.view.accessibility.AccessibilityWindowInfo.UNDEFINED_WINDOW_ID;
+
+import static com.android.car.ui.utils.RotaryConstants.ACTION_HIDE_IME;
+import static com.android.car.ui.utils.RotaryConstants.ACTION_NUDGE_SHORTCUT;
+import static com.android.car.ui.utils.RotaryConstants.ACTION_NUDGE_TO_ANOTHER_FOCUS_AREA;
+import static com.android.car.ui.utils.RotaryConstants.ACTION_RESTORE_DEFAULT_FOCUS;
+import static com.android.car.ui.utils.RotaryConstants.NUDGE_DIRECTION;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
 import android.car.Car;
+import android.car.CarOccupantZoneManager;
 import android.car.input.CarInputManager;
 import android.car.input.RotaryEvent;
 import android.content.ContentResolver;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.res.Resources;
 import android.database.ContentObserver;
 import android.graphics.PixelFormat;
@@ -57,6 +69,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.os.UserManager;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.view.Display;
@@ -75,7 +88,6 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import com.android.car.ui.utils.DirectManipulationHelper;
-import com.android.car.ui.utils.RotaryConstants;
 
 import java.util.Collections;
 import java.util.HashMap;
@@ -112,17 +124,21 @@ import java.util.Map;
 public class RotaryService extends AccessibilityService implements
         CarInputManager.CarInputCaptureCallback {
 
-    /*
-     * Whether to treat the application window as system window for direct manipulation mode. Set it
-     * to {@code true} for testing only.
-     */
-    private static final boolean TREAT_APP_WINDOW_AS_SYSTEM_WINDOW = false;
-
     /**
      * How many detents to rotate when the user holds in shift while pressing C, V, Q, or E on a
      * debug build.
      */
     private static final int SHIFT_DETENTS = 10;
+
+    /**
+     * A value to indicate that it isn't one of the nudge directions. (i.e.
+     * {@link View#FOCUS_LEFT}, {@link View#FOCUS_UP}, {@link View#FOCUS_RIGHT}, or
+     * {@link View#FOCUS_DOWN}).
+     */
+    private static final int INVALID_NUDGE_DIRECTION = -1;
+
+    private static final String SHARED_PREFS = "com.android.car.rotary.RotaryService";
+    private static final String TOUCH_INPUT_METHOD_PREFIX = "TOUCH_INPUT_METHOD_";
 
     @NonNull
     private NodeCopier mNodeCopier = new NodeCopier();
@@ -150,12 +166,12 @@ public class RotaryService extends AccessibilityService implements
      */
     private int mRotationAcceleration2xMs;
 
-    /** Whether to clear focus area history when the user rotates the controller. */
-    private boolean mClearFocusAreaHistoryWhenRotating;
-
     /**
-     * The currently focused node, if any. It's null if no nodes are focused or a {@link
-     * com.android.car.ui.FocusParkingView} is focused.
+     * The currently focused node, if any. This is typically set when performing {@code
+     * ACTION_FOCUS} on a node. However, when performing {@code ACTION_FOCUS} on a {@code
+     * FocusArea}, this is set to the {@code FocusArea} until we receive a {@code TYPE_VIEW_FOCUSED}
+     * event with the descendant of the {@code FocusArea} that was actually focused. It's null if no
+     * nodes are focused or a {@link com.android.car.ui.FocusParkingView} is focused.
      */
     private AccessibilityNodeInfo mFocusedNode = null;
 
@@ -173,23 +189,6 @@ public class RotaryService extends AccessibilityService implements
     private AccessibilityNodeInfo mFocusArea = null;
 
     /**
-     * The previously focused node, if any. It's null if no nodes were focused or a {@link
-     * com.android.car.ui.FocusParkingView} was focused.
-     */
-    private AccessibilityNodeInfo mPreviousFocusedNode = null;
-
-    /**
-     * The currently focused {@link com.android.car.ui.FocusParkingView} that was focused by us to
-     * clear the focus, if any.
-     */
-    private AccessibilityNodeInfo mFocusParkingView = null;
-
-    /**
-     * The current scrollable container, if any. Either {@link #mFocusedNode} or an ancestor of it.
-     */
-    private AccessibilityNodeInfo mScrollableContainer = null;
-
-    /**
      * The last clicked node by touching the screen, if any were clicked since we last navigated.
      */
     private AccessibilityNodeInfo mLastTouchedNode = null;
@@ -203,25 +202,43 @@ public class RotaryService extends AccessibilityService implements
 
     /**
      * When not {@code null}, {@link AccessibilityEvent#TYPE_VIEW_CLICKED} events with this node
-     * are ignored if they occur before {@link #mIgnoreViewClickedUntil}.
+     * are ignored if they occur within {@link #mIgnoreViewClickedMs} of {@link
+     * #mLastViewClickedTime}.
      */
     private AccessibilityNodeInfo mIgnoreViewClickedNode;
 
     /**
-     * When to stop ignoring {@link AccessibilityEvent#TYPE_VIEW_CLICKED} events for {@link
-     * #mIgnoreViewClickedNode} in {@link SystemClock#uptimeMillis}.
+     * The time of the last {@link AccessibilityEvent#TYPE_VIEW_CLICKED} event in {@link
+     * SystemClock#uptimeMillis}.
      */
-    private long mIgnoreViewClickedUntil;
+    private long mLastViewClickedTime;
 
     /** Component name of rotary IME. Empty if none. */
-    private String mRotaryInputMethod;
+    @Nullable private String mRotaryInputMethod;
 
-    /** Component name of IME used in touch mode. Null until first observed. */
-    @Nullable
-    private String mTouchInputMethod;
+    /** Component name of IME used in touch mode. */
+    @Nullable private String mTouchInputMethod;
 
     /** Observer to update {@link #mTouchInputMethod} when the user switches IMEs. */
     private ContentObserver mInputMethodObserver;
+
+    private SharedPreferences mPrefs;
+    private UserManager mUserManager;
+
+    /**
+     * The direction of the HUN. If there is no focused node, or the focused node is outside the
+     * HUN, nudging to this direction will focus on a node inside the HUN.
+     */
+    @View.FocusRealDirection
+    private int mHunNudgeDirection;
+
+    /**
+     * The direction to escape the HUN. If the focused node is inside the HUN, nudging to this
+     * direction will move focus to a node outside the HUN, while nudging to other directions
+     * will do nothing.
+     */
+    @View.FocusRealDirection
+    private int mHunEscapeNudgeDirection;
 
     /**
      * Possible actions to do after receiving {@link AccessibilityEvent#TYPE_VIEW_SCROLLED}.
@@ -262,7 +279,13 @@ public class RotaryService extends AccessibilityService implements
     /** Whether we're in rotary mode (vs touch mode). */
     private boolean mInRotaryMode;
 
-    /** Whether we're in direct manipulation mode. */
+    /**
+     * Whether we're in direct manipulation mode.
+     * <p>
+     * If the focused node supports rotate directly, this mode is controlled by us. Otherwise
+     * this mode is controlled by the client app, which is responsible for updating the mode by
+     * calling {@link DirectManipulationHelper#enableDirectManipulationMode} when needed.
+     */
     private boolean mInDirectManipulationMode;
 
     /** The {@link SystemClock#uptimeMillis} when the last rotary rotation event occurred. */
@@ -273,6 +296,8 @@ public class RotaryService extends AccessibilityService implements
      * button click when the center button is released after a long press.
      */
     private int mCenterButtonRepeatCount;
+
+    private Context mWindowContext;
 
     private static final Map<Integer, Integer> TEST_TO_REAL_KEYCODE_MAP;
 
@@ -318,7 +343,16 @@ public class RotaryService extends AccessibilityService implements
 
     private final WindowCache mWindowCache = new WindowCache();
 
-    private PendingFocusedNodes mPendingFocusedNodes;
+    /**
+     * The last node which has performed {@link AccessibilityNodeInfo#ACTION_FOCUS} if it hasn't
+     * reported a {@link AccessibilityEvent#TYPE_VIEW_FOCUSED} event yet. Null otherwise.
+     */
+    @Nullable private AccessibilityNodeInfo mPendingFocusedNode;
+
+    private long mAfterFocusTimeoutMs;
+
+    /** Expiration time for {@link #mPendingFocusedNode} in {@link SystemClock#uptimeMillis}. */
+    private long mPendingFocusedExpirationTime;
 
     @Override
     public void onCreate() {
@@ -327,30 +361,6 @@ public class RotaryService extends AccessibilityService implements
         mRotationAcceleration3xMs = res.getInteger(R.integer.rotation_acceleration_3x_ms);
         mRotationAcceleration2xMs = res.getInteger(R.integer.rotation_acceleration_2x_ms);
 
-        mClearFocusAreaHistoryWhenRotating =
-                res.getBoolean(R.bool.clear_focus_area_history_when_rotating);
-
-        @RotaryCache.CacheType int focusHistoryCacheType =
-                res.getInteger(R.integer.focus_history_cache_type);
-        int focusHistoryCacheSize =
-                res.getInteger(R.integer.focus_history_cache_size);
-        int focusHistoryExpirationTimeMs =
-                res.getInteger(R.integer.focus_history_expiration_time_ms);
-
-        @RotaryCache.CacheType int focusAreaHistoryCacheType =
-                res.getInteger(R.integer.focus_area_history_cache_type);
-        int focusAreaHistoryCacheSize =
-                res.getInteger(R.integer.focus_area_history_cache_size);
-        int focusAreaHistoryExpirationTimeMs =
-                res.getInteger(R.integer.focus_area_history_expiration_time_ms);
-
-        @RotaryCache.CacheType int focusWindowCacheType =
-                res.getInteger(R.integer.focus_window_cache_type);
-        int focusWindowCacheSize =
-                res.getInteger(R.integer.focus_window_cache_size);
-        int focusWindowExpirationTimeMs =
-                res.getInteger(R.integer.focus_window_expiration_time_ms);
-
         int hunMarginHorizontal =
                 res.getDimensionPixelSize(R.dimen.notification_headsup_card_margin_horizontal);
         int hunLeft = hunMarginHorizontal;
@@ -358,28 +368,37 @@ public class RotaryService extends AccessibilityService implements
         int displayWidth = windowManager.getCurrentWindowMetrics().getBounds().width();
         int hunRight = displayWidth - hunMarginHorizontal;
         boolean showHunOnBottom = res.getBoolean(R.bool.config_showHeadsUpNotificationOnBottom);
+        mHunNudgeDirection = showHunOnBottom ? View.FOCUS_DOWN : View.FOCUS_UP;
+        mHunEscapeNudgeDirection = showHunOnBottom ? View.FOCUS_UP : View.FOCUS_DOWN;
 
         mIgnoreViewClickedMs = res.getInteger(R.integer.ignore_view_clicked_ms);
         mAfterScrollTimeoutMs = res.getInteger(R.integer.after_scroll_timeout_ms);
 
-        mNavigator = new Navigator(
-                focusHistoryCacheType,
-                focusHistoryCacheSize,
-                focusHistoryExpirationTimeMs,
-                focusAreaHistoryCacheType,
-                focusAreaHistoryCacheSize,
-                focusAreaHistoryExpirationTimeMs,
-                focusWindowCacheType,
-                focusWindowCacheSize,
-                focusWindowExpirationTimeMs,
-                hunLeft,
-                hunRight,
-                showHunOnBottom);
+        mNavigator = new Navigator(hunLeft, hunRight, showHunOnBottom);
 
-        mRotaryInputMethod = res.getString(R.string.rotary_input_method);
+        mPrefs = createDeviceProtectedStorageContext().getSharedPreferences(SHARED_PREFS,
+                Context.MODE_PRIVATE);
+        mUserManager = getSystemService(UserManager.class);
 
-        long afterFocusTimeoutMs = res.getInteger(R.integer.after_focus_timeout_ms);
-        mPendingFocusedNodes = new PendingFocusedNodes(afterFocusTimeoutMs);
+        // Verify that the component names for default_touch_input_method and rotary_input_method
+        // are valid. If mTouchInputMethod or mRotaryInputMethod is empty, IMEs should not switch
+        // because RotaryService won't be able to switch them back.
+        String defaultTouchInputMethod = res.getString(R.string.default_touch_input_method);
+        if (isValidIme(defaultTouchInputMethod)) {
+            mTouchInputMethod = mPrefs.getString(
+                TOUCH_INPUT_METHOD_PREFIX + mUserManager.getUserName(), defaultTouchInputMethod);
+            // Set the DEFAULT_INPUT_METHOD in case Android defaults to the rotary_input_method.
+            // TODO(b/169423887): Figure out how to configure the default IME through Android
+            // without needing to do this.
+            Settings.Secure.putString(
+                    getContentResolver(), DEFAULT_INPUT_METHOD, mTouchInputMethod);
+        }
+        String rotaryInputMethod = res.getString(R.string.rotary_input_method);
+        if (isValidIme(rotaryInputMethod)) {
+            mRotaryInputMethod = rotaryInputMethod;
+        }
+
+        mAfterFocusTimeoutMs = res.getInteger(R.integer.after_focus_timeout_ms);
     }
 
     /**
@@ -395,12 +414,7 @@ public class RotaryService extends AccessibilityService implements
         // Guarantee that we always return the same WindowManager instance.
         if (WINDOW_SERVICE.equals(name)) {
             if (mWindowManager == null) {
-                // We need to set the display before creating the WindowContext.
-                DisplayManager displayManager = getSystemService(DisplayManager.class);
-                Display primaryDisplay = displayManager.getDisplay(DEFAULT_DISPLAY);
-                updateDisplay(primaryDisplay.getDisplayId());
-
-                Context windowContext = createWindowContext(TYPE_APPLICATION_OVERLAY, null);
+                Context windowContext = getWindowContext();
                 mWindowManager = (WindowManager) windowContext.getSystemService(WINDOW_SERVICE);
             }
             return mWindowManager;
@@ -419,7 +433,7 @@ public class RotaryService extends AccessibilityService implements
                         mCarInputManager =
                                 (CarInputManager) mCar.getCarManager(Car.CAR_INPUT_SERVICE);
                         mCarInputManager.requestInputEventCapture(this,
-                                CarInputManager.TARGET_DISPLAY_TYPE_MAIN,
+                                CarOccupantZoneManager.DISPLAY_TYPE_MAIN,
                                 mInputTypes,
                                 CarInputManager.CAPTURE_REQ_FLAGS_ALLOW_DELAYED_GRANT);
                     }
@@ -450,7 +464,7 @@ public class RotaryService extends AccessibilityService implements
     public void onDestroy() {
         unregisterInputMethodObserver();
         if (mCarInputManager != null) {
-            mCarInputManager.releaseInputEventCapture(CarInputManager.TARGET_DISPLAY_TYPE_MAIN);
+            mCarInputManager.releaseInputEventCapture(CarOccupantZoneManager.DISPLAY_TYPE_MAIN);
         }
         if (mCar != null) {
             mCar.disconnect();
@@ -485,7 +499,7 @@ public class RotaryService extends AccessibilityService implements
                 break;
             }
             case TYPE_VIEW_SCROLLED: {
-                handleViewScrolledEvent(event, source);
+                handleViewScrolledEvent(source);
                 break;
             }
             case TYPE_WINDOW_STATE_CHANGED: {
@@ -527,8 +541,9 @@ public class RotaryService extends AccessibilityService implements
      * click events.
      */
     @Override
-    public void onKeyEvents(int targetDisplayId, List<KeyEvent> events) {
-        if (!isValidDisplayId(targetDisplayId)) {
+    public void onKeyEvents(@DisplayTypeEnum int targetDisplayType,
+            @NonNull List<KeyEvent> events) {
+        if (!isValidDisplayType(targetDisplayType)) {
             return;
         }
         for (KeyEvent event : events) {
@@ -541,8 +556,9 @@ public class RotaryService extends AccessibilityService implements
      * RotaryEvent}s generated by a navigation controller.
      */
     @Override
-    public void onRotaryEvents(int targetDisplayId, List<RotaryEvent> events) {
-        if (!isValidDisplayId(targetDisplayId)) {
+    public void onRotaryEvents(@DisplayTypeEnum int targetDisplayType,
+            @NonNull List<RotaryEvent> events) {
+        if (!isValidDisplayType(targetDisplayType)) {
             return;
         }
         for (RotaryEvent rotaryEvent : events) {
@@ -550,10 +566,16 @@ public class RotaryService extends AccessibilityService implements
         }
     }
 
-    @Override
-    public void onCaptureStateChanged(int targetDisplayId,
-            @android.annotation.NonNull @CarInputManager.InputTypeEnum int[] activeInputTypes) {
-        // Do nothing.
+    private Context getWindowContext() {
+        if (mWindowContext == null) {
+            // We need to set the display before creating the WindowContext.
+            DisplayManager displayManager = getSystemService(DisplayManager.class);
+            Display primaryDisplay = displayManager.getDisplay(DEFAULT_DISPLAY);
+            updateDisplay(primaryDisplay.getDisplayId());
+
+            mWindowContext = createWindowContext(TYPE_APPLICATION_OVERLAY, null);
+        }
+        return mWindowContext;
     }
 
     /**
@@ -565,7 +587,10 @@ public class RotaryService extends AccessibilityService implements
      * isn't considered a click.
      */
     private void addTouchOverlay() {
-        FrameLayout frameLayout = new FrameLayout(this);
+        // Only views with a visual context, such as a window context, can be added by
+        // WindowManager.
+        FrameLayout frameLayout = new FrameLayout(getWindowContext());
+
         FrameLayout.LayoutParams frameLayoutParams =
                 new FrameLayout.LayoutParams(/* width= */ 0, /* height= */ 0);
         frameLayout.setLayoutParams(frameLayoutParams);
@@ -574,7 +599,7 @@ public class RotaryService extends AccessibilityService implements
             // controller to press keys in the rotary IME also triggers this touch listener, so we
             // ignore these touches.
             if (mIgnoreViewClickedNode == null
-                    || event.getEventTime() >= mIgnoreViewClickedUntil) {
+                    || event.getEventTime() >= mLastViewClickedTime + mIgnoreViewClickedMs) {
                 onTouchEvent();
             }
             return false;
@@ -616,12 +641,16 @@ public class RotaryService extends AccessibilityService implements
             @Override
             public void onChange(boolean selfChange) {
                 // Either the user switched input methods or we did. In the former case, update
-                // mTouchInputMethod so we can switch back after switching to the rotary input
-                // method.
+                // mTouchInputMethod and save it so we can switch back after switching to the rotary
+                // input method.
                 String inputMethod =
                         Settings.Secure.getString(contentResolver, DEFAULT_INPUT_METHOD);
                 if (inputMethod != null && !inputMethod.equals(mRotaryInputMethod)) {
                     mTouchInputMethod = inputMethod;
+                    String userName = mUserManager.getUserName();
+                    mPrefs.edit()
+                            .putString(TOUCH_INPUT_METHOD_PREFIX + userName, mTouchInputMethod)
+                            .apply();
                 }
             }
         };
@@ -639,11 +668,11 @@ public class RotaryService extends AccessibilityService implements
         }
     }
 
-    private static boolean isValidDisplayId(int displayId) {
-        if (displayId == CarInputManager.TARGET_DISPLAY_TYPE_MAIN) {
+    private static boolean isValidDisplayType(int displayType) {
+        if (displayType == CarOccupantZoneManager.DISPLAY_TYPE_MAIN) {
             return true;
         }
-        L.e("RotaryService shouldn't capture events from display ID " + displayId);
+        L.e("RotaryService shouldn't capture events from display type " + displayType);
         return false;
     }
 
@@ -654,7 +683,7 @@ public class RotaryService extends AccessibilityService implements
      */
     private boolean handleKeyEvent(KeyEvent event) {
         int action = event.getAction();
-        boolean isActionDown = action == KeyEvent.ACTION_DOWN;
+        boolean isActionDown = action == ACTION_DOWN;
         int keyCode = getKeyCode(event);
         int detents = event.isShiftPressed() ? SHIFT_DETENTS : 1;
         switch (keyCode) {
@@ -714,83 +743,45 @@ public class RotaryService extends AccessibilityService implements
             @Nullable AccessibilityNodeInfo sourceNode) {
         // A view was focused. We ignore focus changes in touch mode. We don't use
         // TYPE_VIEW_FOCUSED to keep mLastTouchedNode up to date because most views can't be
-        // focused in touch mode. In rotary mode, we use TYPE_VIEW_FOCUSED events to detect whether
-        // a view was focused by us (we performed ACTION_FOCUS) or by Android. Based on that we'll
-        // accept the focus and update mFocusedNode, or move focus to another view.
+        // focused in touch mode.
         if (!mInRotaryMode) {
             return;
         }
-
-        // No need to handle TYPE_VIEW_FOCUSED event if sourceNode is null.
         if (sourceNode == null) {
+            L.w("Null source node in " + event);
             return;
         }
 
-        // The focused node could be a FocusParkingView, or a non-FocusParkingView.
-        // It could be focused by us, or by Android automatically. There are 5 cases:
-
-        // Case 1: the focused node is a FocusParkingView and it was focused by us to clear the
-        // focus in another window. In this case we should do nothing but reset mFocusParkingView.
-        if (sourceNode.equals(mFocusParkingView)) {
-            L.d("A FocusParkingView was focused because we cleared the focus in another window");
-            Utils.recycleNode(mFocusParkingView);
-            mFocusParkingView = null;
-            return;
-        }
-
-        // Case 2: the focused node is a FocusParkingView and it was focused by Android when
-        // scrolling pushed the focused view out of the viewport. When this happens, focus the
-        // scrollable container.
-        boolean isFpv = Utils.isFocusParkingView(sourceNode);
-        if (isFpv && mFocusedNode != null && mScrollableContainer != null
-                && SystemClock.uptimeMillis() < mAfterScrollActionUntil) {
-            mScrollableContainer = Utils.refreshNode(mScrollableContainer);
-            if (mScrollableContainer != null) {
-                L.d("Moving focus from FocusParkingView to scrollable container");
-                performFocusAction(mScrollableContainer);
-            } else {
-                L.d("mScrollableContainer is not in the view tree");
+        // Update mFocusedNode if we're not waiting for focused event caused by performing an
+        // action.
+        refreshPendingFocusedNode();
+        if (mPendingFocusedNode == null) {
+            L.d("Focus event wasn't caused by performing an action");
+            // If it's a FocusParkingView, only update mFocusedNode when it's in the same window
+            // with mFocusedNode.
+            if (Utils.isFocusParkingView(sourceNode)) {
+                if (mFocusedNode != null
+                        && sourceNode.getWindowId() == mFocusedNode.getWindowId()) {
+                    setFocusedNode(null);
+                }
+                return;
             }
+            // If it's not a FocusParkingView, update mFocusedNode.
+            setFocusedNode(sourceNode);
             return;
         }
 
-        // Case 3: we have performed ACTION_FOCUS on non-FocusParkingViews and we are waiting for
-        // them to be focused. In this case we should ignore any other node focused events since
-        // the focus will be moved to a node we're waiting for soon.
-        if (!mPendingFocusedNodes.isEmpty()) {
-            L.d("Waiting for mPendingFocusedNodes to get focused");
-            // If a node we're waiting for, or one of its descendants (i.e., the node is a
-            // FocusArea) finally got focused, remove it from mPendingFocusedNodes.
-            boolean match = mPendingFocusedNodes.removeFirstIf(
-                    node -> sourceNode.equals(node) || Utils.isDescendant(node, sourceNode));
-            if (match && !sourceNode.equals(mFocusedNode)) {
-                setFocusedNode(sourceNode);
-            }
+        // If we're waiting for focused event but this isn't the one we're waiting for, ignore this
+        // event. This event doesn't matter because focus has moved from sourceNode to
+        // mPendingFocusedNode.
+        if (!sourceNode.equals(mPendingFocusedNode)) {
+            L.d("Ignoring focus event because focus has since moved");
             return;
         }
 
-        // The node was focused by Android automatically. For example:
-        // 1. When the previously focused view is removed by the app, Android will focus on
-        //    the first focusable view in the window, which is a FocusParkingView (because we
-        //    require that a FocusParkingView must be placed as the first focusable view in a
-        //    window).
-        // 2. When a dialog window is opened via the rotary controller, Android will focus on the
-        //    previously focused view in the dialog window, if any, or the first focusable view in
-        //    the dialog window if there are no previously focused views. In the former case the
-        //    focused view is a non-FocusParkingView (such as the "Close" button), in the later case
-        //    the focused view is a FocusParkingView.
-
-        // Case 4: Android focused on a FocusParkingView. We should try to move focus to another
-        // view nearby.
-        if (isFpv) {
-            L.d("Move focus to a nearby view because Android focused a FocusParkingView");
-            onFocusParkingViewFocusedAutomatically(sourceNode);
-            return;
-        }
-
-        // Case 5: Android focused a non-FocusParkingView. We should update mFocusedNode.
-        L.d("Android focused a non-FocusParkingView automatically " + sourceNode);
-        onNodeFocusedAutomatically(sourceNode);
+        // The event we're waiting for has arrived, so reset mPendingFocusedNode.
+        L.d("Ignoring focus event caused by performing an action");
+        setPendingFocusedNode(null);
     }
 
     /** Handles {@link AccessibilityEvent#TYPE_VIEW_CLICKED} event. */
@@ -810,7 +801,7 @@ public class RotaryService extends AccessibilityService implements
         // because window remove event (TYPE_WINDOWS_CHANGED with type
         // WINDOWS_CHANGE_REMOVED) comes AFTER click event.
         if (mIgnoreViewClickedNode != null
-                && event.getEventTime() < mIgnoreViewClickedUntil
+                && event.getEventTime() < mLastViewClickedTime + mIgnoreViewClickedMs
                 && ((sourceNode == null) || mIgnoreViewClickedNode.equals(sourceNode))) {
             setIgnoreViewClickedNode(null);
             return;
@@ -834,8 +825,7 @@ public class RotaryService extends AccessibilityService implements
     }
 
     /** Handles {@link AccessibilityEvent#TYPE_VIEW_SCROLLED} event. */
-    private void handleViewScrolledEvent(@NonNull AccessibilityEvent event,
-            @Nullable AccessibilityNodeInfo sourceNode) {
+    private void handleViewScrolledEvent(@Nullable AccessibilityNodeInfo sourceNode) {
         if (mAfterScrollAction == AfterScrollAction.NONE
                 || SystemClock.uptimeMillis() >= mAfterScrollActionUntil) {
             return;
@@ -849,7 +839,7 @@ public class RotaryService extends AccessibilityService implements
                 if (mFocusedNode.equals(sourceNode)) {
                     break;
                 }
-                AccessibilityNodeInfo target = Navigator.findFocusableDescendantInDirection(
+                AccessibilityNodeInfo target = mNavigator.findFocusableDescendantInDirection(
                         sourceNode, mFocusedNode,
                         mAfterScrollAction == AfterScrollAction.FOCUS_PREVIOUS
                                 ? View.FOCUS_BACKWARD
@@ -857,10 +847,10 @@ public class RotaryService extends AccessibilityService implements
                 if (target == null) {
                     break;
                 }
-                L.d("Focusing %s after scroll",
-                        mAfterScrollAction == AfterScrollAction.FOCUS_PREVIOUS
-                                ? "previous"
-                                : "next");
+                L.d("Focusing "
+                        + (mAfterScrollAction == AfterScrollAction.FOCUS_PREVIOUS
+                            ? "previous" : "next")
+                        + " after scroll");
                 if (performFocusAction(target)) {
                     mAfterScrollAction = AfterScrollAction.NONE;
                 }
@@ -876,8 +866,9 @@ public class RotaryService extends AccessibilityService implements
                 if (target == null) {
                     break;
                 }
-                L.d("Focusing %s after scroll",
-                        mAfterScrollAction == AfterScrollAction.FOCUS_FIRST ? "first" : "last");
+                L.d("Focusing "
+                        + (mAfterScrollAction == AfterScrollAction.FOCUS_FIRST ? "first" : "last")
+                        + " after scroll");
                 if (performFocusAction(target)) {
                     mAfterScrollAction = AfterScrollAction.NONE;
                 }
@@ -921,11 +912,7 @@ public class RotaryService extends AccessibilityService implements
         }
 
         // Restore focus to the last focused node in the last focused window.
-        Integer lastWindowId = mWindowCache.getMostRecentWindowId();
-        if (lastWindowId == null ) {
-            return;
-        }
-        AccessibilityNodeInfo recentFocus = mNavigator.getMostRecentFocus(lastWindowId);
+        AccessibilityNodeInfo recentFocus = mWindowCache.getMostRecentFocusedNode();
         if (recentFocus != null) {
             performFocusAction(recentFocus);
             recentFocus.recycle();
@@ -945,7 +932,7 @@ public class RotaryService extends AccessibilityService implements
             Utils.recycleWindows(windows);
             return;
         }
-        mWindowCache.put(windowId, window.getType());
+        mWindowCache.saveWindowType(windowId, window.getType());
 
         // Nothing more to do if we're in touch mode.
         if (!mInRotaryMode) {
@@ -960,8 +947,8 @@ public class RotaryService extends AccessibilityService implements
             return;
         }
 
-        // No need to move focus for non-IME window because in most cases Android will initialize
-        // the focus automatically.
+        // No need to move focus for non-IME window here, because in most cases Android will focus
+        // the FocusParkingView in the added window, and we'll move focus when handling it.
         if (window.getType() != TYPE_INPUT_METHOD) {
             Utils.recycleWindows(windows);
             return;
@@ -976,19 +963,61 @@ public class RotaryService extends AccessibilityService implements
         }
         Utils.recycleWindows(windows);
 
-        // TODO: Use app:defaultFocus
-        AccessibilityNodeInfo nodeToFocus = mNavigator.findFirstFocusDescendant(root);
-        root.recycle();
-        if (nodeToFocus != null) {
-            L.d("Move focus to IME");
-            // If the focused node is editable, save it so that we can return to it when the user
-            // nudges out of the IME.
-            if  (mFocusedNode != null && mFocusedNode.isEditable()) {
-                setEditNode(mFocusedNode);
-            }
-            performFocusAction(nodeToFocus);
-            nodeToFocus.recycle();
+        // If the focused node is editable, save it so that we can return to it when the user
+        // nudges out of the IME.
+        if (mFocusedNode != null && mFocusedNode.isEditable()) {
+            setEditNode(mFocusedNode);
         }
+
+        boolean success = restoreDefaultFocus(root);
+        if (!success) {
+            L.d("Failed to restore default focus in " + root);
+        }
+        root.recycle();
+    }
+
+    private boolean restoreDefaultFocus(@NonNull AccessibilityNodeInfo node) {
+        AccessibilityNodeInfo fpv = mNavigator.findFocusParkingView(node);
+
+        // Refresh the node to ensure the focused state is up to date. The node came directly from
+        // the node tree but it could have been cached by the accessibility framework.
+        fpv = Utils.refreshNode(fpv);
+
+        if (fpv == null) {
+            L.e("No FocusParkingView in the window containing " + node);
+            return false;
+        }
+
+        if (Utils.isCarUiFocusParkingView(fpv)) {
+            boolean result = fpv.performAction(ACTION_RESTORE_DEFAULT_FOCUS);
+            fpv.recycle();
+            if (result) {
+                findFocusedNode(node);
+            }
+            return result;
+        }
+
+        AccessibilityWindowInfo window = fpv.getWindow();
+        fpv.recycle();
+        if (window == null) {
+            L.e("No window found for the generic FocusParkingView");
+            return false;
+        }
+        AccessibilityNodeInfo root = window.getRoot();
+        window.recycle();
+        if (root == null) {
+            L.w("No root node in " + window);
+            return false;
+        }
+        AccessibilityNodeInfo firstFocusable = mNavigator.findFirstFocusableDescendant(root);
+        root.recycle();
+        if (firstFocusable == null) {
+            L.e("No focusable element in the window containing the generic FocusParkingView");
+            return false;
+        }
+        boolean success = performFocusAction(firstFocusable);
+        firstFocusable.recycle();
+        return success;
     }
 
     private static int getKeyCode(KeyEvent event) {
@@ -1010,30 +1039,41 @@ public class RotaryService extends AccessibilityService implements
         if (initFocus()) {
             return;
         }
-        // Case 1: the focus is in application window, inject KeyEvent.KEYCODE_DPAD_CENTER event and
-        // the application will handle it.
-        if (isInApplicationWindow(mFocusedNode)) {
-            injectKeyEvent(KeyEvent.KEYCODE_DPAD_CENTER, action);
-            setIgnoreViewClickedNode(mFocusedNode);
-            return;
-        }
-        // We're done with ACTION_DOWN event.
-        if (action == KeyEvent.ACTION_DOWN) {
-            return;
-        }
-
-        // Case 2: the focus is not in application window (e.g., in system window) and the focused
-        // node supports direct manipulation, enter direct manipulation mode.
-        if (DirectManipulationHelper.supportDirectManipulation(mFocusedNode)) {
+        // Case 1: the focused node supports rotate directly. We should ignore ACTION_DOWN event,
+        // and enter direct manipulation mode on ACTION_UP event.
+        if (DirectManipulationHelper.supportRotateDirectly(mFocusedNode)) {
+            if (action == ACTION_DOWN) {
+                return;
+            }
             if (!mInDirectManipulationMode) {
                 mInDirectManipulationMode = true;
+                boolean result = mFocusedNode.performAction(ACTION_SELECT);
+                if (!result) {
+                    L.w("Failed to perform ACTION_SELECT on " + mFocusedNode);
+                }
                 L.d("Enter direct manipulation mode because focused node is clicked.");
             }
             return;
         }
 
-        // Case 3: the focus is not in application window and the focused node doesn't support
-        // direct manipulation, perform click or long click on the focused node.
+        // Case 2: the focused node doesn't support rotate directly and it's in application window.
+        // We should inject KEYCODE_DPAD_CENTER event (or KEYCODE_ENTER in a WebView), then the
+        // application will handle the injected event.
+        if (isInApplicationWindow(mFocusedNode)) {
+            int keyCode = mNavigator.isInWebView(mFocusedNode)
+                    ? KeyEvent.KEYCODE_ENTER
+                    : KeyEvent.KEYCODE_DPAD_CENTER;
+            injectKeyEvent(keyCode, action);
+            setIgnoreViewClickedNode(mFocusedNode);
+            return;
+        }
+
+        // Case 3: the focus node doesn't support rotate directly and it's not in application window
+        // (e.g., in system window). We should ignore ACTION_DOWN event, and click or long click
+        // the focused node on ACTION_UP event.
+        if (action == ACTION_DOWN) {
+            return;
+        }
         boolean result = mFocusedNode.performAction(longClick ? ACTION_LONG_CLICK : ACTION_CLICK);
         if (!result) {
             L.w("Failed to perform " + (longClick ? "ACTION_LONG_CLICK" : "ACTION_CLICK")
@@ -1048,46 +1088,127 @@ public class RotaryService extends AccessibilityService implements
         if (!isValidAction(action)) {
             return;
         }
-        if (initFocus()) {
-            return;
-        }
 
         // If the focused node is in direct manipulation mode, manipulate it directly.
         if (mInDirectManipulationMode) {
-            if (isInApplicationWindow(mFocusedNode)) {
-                injectKeyEventForDirection(direction, action);
+            if (DirectManipulationHelper.supportRotateDirectly(mFocusedNode)) {
+                L.d("Ignore nudge events because we're in DM mode and the focused node only "
+                        + "supports rotate directly");
             } else {
-                L.d("Ignore nudge events because we're in DM mode and the focus is not in"
-                        + " application window");
+                injectKeyEventForDirection(direction, action);
             }
             return;
         }
 
         // We're done with ACTION_UP event.
-        if (action == KeyEvent.ACTION_UP) {
+        if (action == ACTION_UP) {
             return;
         }
 
-        // If the focused node is not in direct manipulation mode, move the focus.
-        // TODO(b/152438801): sometimes getWindows() takes 10s after boot.
         List<AccessibilityWindowInfo> windows = getWindows();
-        mEditNode = Utils.refreshNode(mEditNode);
-        AccessibilityNodeInfo targetNode =
-                mNavigator.findNudgeTarget(windows, mFocusedNode, direction, mEditNode);
-        Utils.recycleWindows(windows);
-        if (targetNode == null) {
-            L.w("Failed to find nudge target");
+
+        // Don't call initFocus() when handling ACTION_UP nudge events as this event will typically
+        // arrive before the TYPE_VIEW_FOCUSED event when we delegate focusing to a FocusArea, and
+        // will cause us to focus a nearby view when we discover that mFocusedNode is no longer
+        // focused.
+        if (initFocus(windows, direction)) {
+            Utils.recycleWindows(windows);
             return;
         }
 
-        // If the user is nudging out of the IME to the node being edited, we no longer need to keep
-        // track of the node being edited.
-        if (targetNode.equals(mEditNode)) {
-            setEditNode(null);
+        // If the HUN is currently focused, we should only handle nudge events that are in the
+        // opposite direction of the HUN nudge direction.
+        if (mNavigator.isHunWindow(mFocusedNode.getWindow())
+                && direction != mHunEscapeNudgeDirection) {
+            Utils.recycleWindows(windows);
+            return;
         }
 
-        performFocusAction(targetNode);
-        Utils.recycleNode(targetNode);
+        // If the focused node is not in direct manipulation mode, try to move the focus to another
+        // node.
+        boolean success = nudgeTo(windows, direction);
+        Utils.recycleWindows(windows);
+
+        // If the user is nudging out of the IME to the node being edited, we no longer need
+        // to keep track of the node being edited.
+        if (success) {
+            mEditNode = Utils.refreshNode(mEditNode);
+            if (mEditNode != null && mEditNode.isFocused()) {
+                setEditNode(null);
+            }
+        }
+    }
+
+    private boolean nudgeTo(@NonNull List<AccessibilityWindowInfo> windows, int direction) {
+        // If the HUN is in the nudge direction, nudge to it.
+        AccessibilityNodeInfo hunFocusArea =
+                mNavigator.findHunFocusArea(windows, mFocusedNode, direction);
+        boolean success;
+        if (hunFocusArea != null) {
+            success = performFocusAction(hunFocusArea);
+            L.d(success ? "Nudge to HUN" : " Failed to nudge to HUN " + hunFocusArea);
+            hunFocusArea.recycle();
+            if (success) {
+                return true;
+            }
+        }
+
+        // Try to move the focus to the shortcut node.
+        if (mFocusArea == null) {
+            L.e("mFocusArea shouldn't be null");
+            return false;
+        }
+        Bundle arguments = new Bundle();
+        arguments.putInt(NUDGE_DIRECTION, direction);
+        if (mFocusArea.performAction(ACTION_NUDGE_SHORTCUT, arguments)) {
+            L.d("Nudge to shortcut view");
+            AccessibilityNodeInfo root = Utils.getRoot(mFocusArea);
+            if (root != null) {
+                findFocusedNode(root);
+                root.recycle();
+            }
+            return true;
+        }
+
+        // No shortcut node, so move the focus in the given direction.
+        // First, try to perform ACTION_NUDGE on mFocusArea to nudge to another FocusArea.
+        arguments.clear();
+        arguments.putInt(NUDGE_DIRECTION, direction);
+        if (mFocusArea.performAction(ACTION_NUDGE_TO_ANOTHER_FOCUS_AREA, arguments)) {
+            L.d("Nudge to user specified FocusArea");
+            AccessibilityNodeInfo root = Utils.getRoot(mFocusArea);
+            if (root != null) {
+                findFocusedNode(root);
+                root.recycle();
+            }
+            return true;
+        }
+
+        // No specified FocusArea or cached FocusArea in the direction, so mFocusArea doesn't know
+        // what FocusArea to nudge to. In this case, we'll find a target FocusArea using geometry.
+        AccessibilityNodeInfo targetFocusArea =
+                mNavigator.findNudgeTargetFocusArea(windows, mFocusedNode, mFocusArea, direction);
+        if (targetFocusArea == null) {
+            L.d("Failed to find a target FocusArea for the nudge");
+            return false;
+        }
+        if (Utils.isFocusArea(targetFocusArea)) {
+            arguments.clear();
+            arguments.putInt(NUDGE_DIRECTION, direction);
+            success = performFocusAction(targetFocusArea, arguments);
+            L.d("Nudging to the nearest FocusArea "
+                    + (success ? "succeeded" : "failed: " + targetFocusArea));
+            targetFocusArea.recycle();
+            return success;
+        }
+
+        // targetFocusArea is an implicit FocusArea (i.e., the root node of a window without any
+        // FocusAreas), so restore the focus in it.
+        success = restoreDefaultFocus(targetFocusArea);
+        L.d("Nudging to the nearest implicit focus area "
+                + (success ? "succeeded" : "failed: " + targetFocusArea));
+        targetFocusArea.recycle();
+        return success;
     }
 
     private void handleRotaryEvent(RotaryEvent rotaryEvent) {
@@ -1102,31 +1223,17 @@ public class RotaryService extends AccessibilityService implements
     }
 
     private void handleRotateEvent(boolean clockwise, int count, long eventTime) {
-        // Clear focus area history if configured to do so, but not when rotating in the HUN. The
-        // HUN overlaps the application window so it's common for focus areas to overlap, causing
-        // geometric searches to fail. History is essential here.
-        if (mClearFocusAreaHistoryWhenRotating && !isFocusInHunWindow()) {
-            mNavigator.clearFocusAreaHistory();
-        }
         if (initFocus()) {
             return;
         }
 
         int rotationCount = getRotateAcceleration(count, eventTime);
 
-        // If a scrollable container is focused, no focusable descendants are visible, so scroll the
-        // container.
-        AccessibilityNodeInfo.AccessibilityAction scrollAction =
-                clockwise ? ACTION_SCROLL_FORWARD : ACTION_SCROLL_BACKWARD;
-        if (mFocusedNode != null && Utils.isScrollableContainer(mFocusedNode)
-                && mFocusedNode.getActionList().contains(scrollAction)) {
-            injectScrollEvent(mFocusedNode, clockwise, rotationCount);
-            return;
-        }
-
         // If the focused node is in direct manipulation mode, manipulate it directly.
         if (mInDirectManipulationMode) {
-            if (isInApplicationWindow(mFocusedNode)) {
+            if (DirectManipulationHelper.supportRotateDirectly(mFocusedNode)) {
+                performScrollAction(mFocusedNode, clockwise);
+            } else {
                 AccessibilityWindowInfo window = mFocusedNode.getWindow();
                 if (window == null) {
                     L.w("Failed to get window of " + mFocusedNode);
@@ -1137,8 +1244,6 @@ public class RotaryService extends AccessibilityService implements
                 // TODO(b/155823126): Add config to let OEMs determine the mapping.
                 injectMotionEvent(displayId, MotionEvent.AXIS_SCROLL,
                         clockwise ? rotationCount : -rotationCount);
-            } else {
-                performScrollAction(mFocusedNode, clockwise);
             }
             return;
         }
@@ -1165,9 +1270,13 @@ public class RotaryService extends AccessibilityService implements
         // is only supported in the application window because injected events always go to the
         // application window. We don't bother checking whether the scrollable container can
         // currently scroll because there's nothing else to do if it can't.
-        if (remainingRotationCount > 0 && isInApplicationWindow(mFocusedNode)
-                && mScrollableContainer != null) {
-            injectScrollEvent(mScrollableContainer, clockwise, remainingRotationCount);
+        if (remainingRotationCount > 0 && isInApplicationWindow(mFocusedNode)) {
+            AccessibilityNodeInfo scrollableContainer =
+                    mNavigator.findScrollableContainer(mFocusedNode);
+            if (scrollableContainer != null) {
+                injectScrollEvent(scrollableContainer, clockwise, remainingRotationCount);
+                scrollableContainer.recycle();
+            }
         }
     }
 
@@ -1176,15 +1285,22 @@ public class RotaryService extends AccessibilityService implements
         if (!isValidAction(action)) {
             return;
         }
-
-        // If the focus is in application window, inject Back button event and the application will
-        // handle it. If the focus is not in application window, exit direct manipulation mode on
-        // key up.
-        if (isInApplicationWindow(mFocusedNode)) {
+        // If the focused node doesn't support rotate directly, inject Back button event, then the
+        // application will handle the injected event.
+        if (!DirectManipulationHelper.supportRotateDirectly(mFocusedNode)) {
             injectKeyEvent(KeyEvent.KEYCODE_BACK, action);
-        } else if (action == KeyEvent.ACTION_UP) {
-            L.d("Exit direct manipulation mode on back button event");
-            mInDirectManipulationMode = false;
+            return;
+        }
+
+        // Otherwise exit direct manipulation mode on ACTION_UP event.
+        if (action == ACTION_DOWN) {
+            return;
+        }
+        L.d("Exit direct manipulation mode on back button event");
+        mInDirectManipulationMode = false;
+        boolean result = mFocusedNode.performAction(ACTION_CLEAR_SELECTION);
+        if (!result) {
+            L.w("Failed to perform ACTION_CLEAR_SELECTION on " + mFocusedNode);
         }
     }
 
@@ -1200,7 +1316,7 @@ public class RotaryService extends AccessibilityService implements
     }
 
     private static boolean isValidAction(int action) {
-        if (action != KeyEvent.ACTION_DOWN && action != KeyEvent.ACTION_UP) {
+        if (action != ACTION_DOWN && action != ACTION_UP) {
             L.w("Invalid action " + action);
             return false;
         }
@@ -1225,30 +1341,12 @@ public class RotaryService extends AccessibilityService implements
 
     /** Returns whether the given {@code node} is in the application window. */
     private static boolean isInApplicationWindow(@NonNull AccessibilityNodeInfo node) {
-        if (TREAT_APP_WINDOW_AS_SYSTEM_WINDOW) {
-            return false;
-        }
         AccessibilityWindowInfo window = node.getWindow();
         if (window == null) {
             L.w("Failed to get window of " + node);
             return false;
         }
         boolean result = window.getType() == TYPE_APPLICATION;
-        Utils.recycleWindow(window);
-        return result;
-    }
-
-    /** Returns whether {@link #mFocusedNode} is in the HUN window. */
-    private boolean isFocusInHunWindow() {
-        if (mFocusedNode == null) {
-            return false;
-        }
-        AccessibilityWindowInfo window = mFocusedNode.getWindow();
-        if (window == null) {
-            L.w("Failed to get window of " + mFocusedNode);
-            return false;
-        }
-        boolean result = mNavigator.isHunWindow(window);
         Utils.recycleWindow(window);
         return result;
     }
@@ -1383,8 +1481,6 @@ public class RotaryService extends AccessibilityService implements
         mFocusedNode = Utils.refreshNode(mFocusedNode);
         mEditNode = Utils.refreshNode(mEditNode);
         mLastTouchedNode = Utils.refreshNode(mLastTouchedNode);
-        mScrollableContainer = Utils.refreshNode(mScrollableContainer);
-        mPreviousFocusedNode = Utils.refreshNode(mPreviousFocusedNode);
         mFocusArea = Utils.refreshNode(mFocusArea);
         mIgnoreViewClickedNode = Utils.refreshNode(mIgnoreViewClickedNode);
     }
@@ -1394,69 +1490,82 @@ public class RotaryService extends AccessibilityService implements
      * following:<ol>
      *     <li>If {@link #mFocusedNode} isn't null and represents a view that still exists, does
      *         nothing. The event isn't consumed in this case. This is the normal case.
-     *     <li>If {@link #mScrollableContainer} isn't null and represents a view that still exists,
-     *         focuses it. The event isn't consumed in this case. This can happen when the user
-     *         rotates quickly as they scroll into a section without any focusable views.
+     *     <li>If there is a non-FocusParkingView focused in any window, set mFocusedNode to that
+     *         view.
      *     <li>If {@link #mLastTouchedNode} isn't null and represents a view that still exists,
      *         focuses it. The event is consumed in this case. This happens when the user switches
      *         from touch to rotary.
-     *     <li>If there is a most recently focused node in the cache, focuses it. The event is
-     *         consumed in this case.
-     *     <li>Otherwise focuses the first focus descendant and consumes the event.
+     *     <li>Otherwise focuses the best target in the node tree and consumes the event.
      * </ol>
      *
      * @return whether the event was consumed by this method. When {@code false},
      *         {@link #mFocusedNode} is guaranteed to not be {@code null}.
      */
     private boolean initFocus() {
+        List<AccessibilityWindowInfo> windows = getWindows();
+        boolean consumed = initFocus(windows, INVALID_NUDGE_DIRECTION);
+        Utils.recycleWindows(windows);
+        return consumed;
+    }
+
+    /**
+     * Similar to above, but also checks for heads-up notifications if given a valid nudge direction
+     * which may be relevant when we're trying to focus the HUNs when coming from touch mode.
+     *
+     * @param windows the windows currently available to the Accessibility Service
+     * @param direction the direction of the nudge that was received (can be
+     *                  {@link #INVALID_NUDGE_DIRECTION})
+     * @return whether the event was consumed by this method. When {@code false},
+     *         {@link #mFocusedNode} is guaranteed to not be {@code null}.
+     */
+    private boolean initFocus(@NonNull List<AccessibilityWindowInfo> windows, int direction) {
+        boolean prevInRotaryMode = mInRotaryMode;
         refreshSavedNodes();
         setInRotaryMode(true);
         if (mFocusedNode != null) {
+            // If mFocusedNode is focused, we're in a good state and can proceed with whatever
+            // action the user requested.
             if (mFocusedNode.isFocused()) {
                 return false;
             }
-            // mFocusedNode is still in the view tree, but its state has changed and it's not
-            // focused any more. In this case we should set mFocusedNode to null.
-            setFocusedNode(null);
-        }
-        if (mScrollableContainer != null) {
-            if (performFocusAction(mScrollableContainer)) {
+            // If the focused node represents an HTML element in a WebView, we just assume the focus
+            // is already initialized here, and we'll handle it properly when the user uses the
+            // controller next time.
+            if (mNavigator.isInWebView(mFocusedNode)) {
                 return false;
             }
         }
-        if (mLastTouchedNode != null) {
-            if (focusLastTouchedNode()) {
-                return true;
-            }
-        }
-        if (focusOnMostRecentFocus()) {
+
+        // If we were not in rotary mode before and we can focus the HUNs window for the given
+        // nudge, focus the window and ensure that there is no previously touched node.
+        if (!prevInRotaryMode && windows != null && focusHunsWindow(windows, direction)) {
+            setLastTouchedNode(null);
             return true;
         }
-        focusFirstFocusDescendant();
-        return true;
-    }
 
-    private boolean focusOnMostRecentFocus() {
+        // If there is a non-FocusParkingView focused in any window, set mFocusedNode to that view.
+        for (AccessibilityWindowInfo window : windows) {
+            AccessibilityNodeInfo root = window.getRoot();
+            if (root != null) {
+                AccessibilityNodeInfo focusedNode = root.findFocus(FOCUS_INPUT);
+                root.recycle();
+                if (focusedNode != null && !Utils.isFocusParkingView(focusedNode)) {
+                    setFocusedNode(focusedNode);
+                    focusedNode.recycle();
+                    return false;
+                }
+            }
+        }
+
+        if (mLastTouchedNode != null && focusLastTouchedNode()) {
+            return true;
+        }
         AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) {
-            L.e("Root node of active window is null");
-            return false;
+        if (root != null) {
+            restoreDefaultFocus(root);
+            Utils.recycleNode(root);
         }
-        int windowId = root.getWindowId();
-        if (windowId == UNDEFINED_WINDOW_ID) {
-            L.e("No windowId for node: " + root);
-            root.recycle();
-            return false;
-        }
-
-        root.recycle();
-        boolean success = false;
-        AccessibilityNodeInfo recentFocus = mNavigator.getMostRecentFocus(windowId);
-        if (recentFocus != null) {
-            success = performFocusAction(recentFocus);
-            recentFocus.recycle();
-        }
-        return success;
+        return true;
     }
 
     /**
@@ -1467,6 +1576,7 @@ public class RotaryService extends AccessibilityService implements
      * might go out of sync.
      */
     private void maybeClearFocusInCurrentWindow(@Nullable AccessibilityNodeInfo targetFocus) {
+        mFocusedNode = Utils.refreshNode(mFocusedNode);
         if (mFocusedNode == null || !mFocusedNode.isFocused()
                 || (targetFocus != null
                         && mFocusedNode.getWindowId() == targetFocus.getWindowId())) {
@@ -1475,16 +1585,13 @@ public class RotaryService extends AccessibilityService implements
 
         // If we're moving from an editable node to the IME, don't clear focus, but save the
         // editable node so that we can return to it when the user nudges out of the IME.
-        if (mFocusedNode.isEditable()) {
-            AccessibilityWindowInfo targetWindow = targetFocus.getWindow();
-            if (targetWindow != null) {
-                boolean isTargetInIme = targetWindow.getType() == TYPE_INPUT_METHOD;
-                targetWindow.recycle();
-                if (isTargetInIme) {
-                    L.d("Leaving editable field focused");
-                    setEditNode(mFocusedNode);
-                    return;
-                }
+        if (mFocusedNode.isEditable() && targetFocus != null) {
+            int targetWindowId = targetFocus.getWindowId();
+            Integer windowType = mWindowCache.getWindowType(targetWindowId);
+            if (windowType != null && windowType == TYPE_INPUT_METHOD) {
+                L.d("Leaving editable field focused");
+                setEditNode(mFocusedNode);
+                return;
             }
         }
 
@@ -1507,23 +1614,49 @@ public class RotaryService extends AccessibilityService implements
             L.e("Don't call clearFocusInCurrentWindow() when mFocusedNode is null");
             return false;
         }
-        AccessibilityNodeInfo focusParkingView = findFocusParkingView(mFocusedNode);
-        if (focusParkingView == null) {
+        AccessibilityNodeInfo fpv = mNavigator.findFocusParkingView(mFocusedNode);
+
+        // Refresh the node to ensure the focused state is up to date. The node came directly from
+        // the node tree but it could have been cached by the accessibility framework.
+        fpv = Utils.refreshNode(fpv);
+
+        if (fpv == null) {
+            L.e("No FocusParkingView in the window that contains " + mFocusedNode);
             return false;
         }
-        boolean result = focusParkingView.performAction(ACTION_FOCUS);
-        if (result) {
-            if (mFocusParkingView != null) {
-                L.e("mFocusParkingView should be null but is " + mFocusParkingView);
-                Utils.recycleNode(mFocusParkingView);
-            }
-            mFocusParkingView = copyNode(focusParkingView);
-            L.d("Performed focus on FocusParkingView: " + focusParkingView);
-        } else {
-            L.w("Failed to perform ACTION_FOCUS on FocusParkingView: " + focusParkingView);
+        if (fpv.isFocused()) {
+            L.d("FocusParkingView is already focused " + fpv);
+            return true;
         }
-        focusParkingView.recycle();
+        boolean result = performFocusAction(fpv);
+        if (!result) {
+            L.w("Failed to perform ACTION_FOCUS on " + fpv);
+        }
+        fpv.recycle();
         return result;
+    }
+
+    private boolean focusHunsWindow(@NonNull List<AccessibilityWindowInfo> windows, int direction) {
+        if (direction != mHunNudgeDirection) {
+            return false;
+        }
+
+        AccessibilityWindowInfo hunWindow = mNavigator.findHunWindow(windows);
+        if (hunWindow == null) {
+            L.d("No HUN window to focus");
+            return false;
+        }
+
+        AccessibilityNodeInfo hunRoot = hunWindow.getRoot();
+        if (hunRoot == null) {
+            L.d("No root in HUN Window to focus");
+            return false;
+        }
+
+        boolean success = restoreDefaultFocus(hunRoot);
+        hunRoot.recycle();
+        L.d("HUN window focus " + (success ? "successful" : "failed"));
+        return success;
     }
 
     /**
@@ -1541,26 +1674,6 @@ public class RotaryService extends AccessibilityService implements
             }
         }
         return lastTouchedNodeFocused;
-    }
-
-    /**
-     * Focuses the first focus descendant (a node inside a focus area that can take focus) in the
-     * currently active window, if any.
-     */
-    private void focusFirstFocusDescendant() {
-        AccessibilityNodeInfo rootNode = getRootInActiveWindow();
-        if (rootNode == null) {
-            L.e("rootNode of active window is null");
-            return;
-        }
-        AccessibilityNodeInfo targetNode = mNavigator.findFirstFocusDescendant(rootNode);
-        rootNode.recycle();
-        if (targetNode == null) {
-            L.w("Failed to find the first focus descendant");
-            return;
-        }
-        performFocusAction(targetNode);
-        targetNode.recycle();
     }
 
     /**
@@ -1592,11 +1705,6 @@ public class RotaryService extends AccessibilityService implements
         // Close the IME when navigating from an editable view to a non-editable view.
         maybeCloseIme(focusedNode);
 
-        Utils.recycleNode(mPreviousFocusedNode);
-        mFocusedNode = Utils.refreshNode(mFocusedNode);
-        mPreviousFocusedNode = copyNode(mFocusedNode);
-        L.d("mPreviousFocusedNode set to: " + mPreviousFocusedNode);
-
         Utils.recycleNode(mFocusedNode);
         mFocusedNode = copyNode(focusedNode);
         L.d("mFocusedNode set to: " + mFocusedNode);
@@ -1604,20 +1712,25 @@ public class RotaryService extends AccessibilityService implements
         Utils.recycleNode(mFocusArea);
         mFocusArea = mFocusedNode == null ? null : mNavigator.getAncestorFocusArea(mFocusedNode);
 
-        // Set mScrollableContainer to the scrollable container which contains mFocusedNode, if any.
-        // Skip if mFocusedNode is a FocusParkingView. The FocusParkingView is focused when the
-        // focus view is scrolled off the screen. We'll focus the scrollable container when we
-        // receive the TYPE_VIEW_FOCUSED event in this case.
-        if (mFocusedNode == null) {
-            setScrollableContainer(null);
-        } else if (!Utils.isFocusParkingView(mFocusedNode)) {
-            setScrollableContainer(mNavigator.findScrollableContainer(mFocusedNode));
-        }
-
-        // Cache the focused node by focus area.
         if (mFocusedNode != null) {
-            mNavigator.saveFocusedNode(mFocusedNode);
+            mWindowCache.saveFocusedNode(mFocusedNode.getWindowId(), mFocusedNode);
         }
+    }
+
+    private void refreshPendingFocusedNode() {
+        if (mPendingFocusedNode != null) {
+            if (SystemClock.uptimeMillis() > mPendingFocusedExpirationTime) {
+                setPendingFocusedNode(null);
+            } else {
+                mPendingFocusedNode = Utils.refreshNode(mPendingFocusedNode);
+            }
+        }
+    }
+
+    private void setPendingFocusedNode(@Nullable AccessibilityNodeInfo node) {
+        Utils.recycleNode(mPendingFocusedNode);
+        mPendingFocusedNode = copyNode(node);
+        mPendingFocusedExpirationTime = SystemClock.uptimeMillis() + mAfterFocusTimeoutMs;
     }
 
     private void setEditNode(@Nullable AccessibilityNodeInfo editNode) {
@@ -1649,44 +1762,15 @@ public class RotaryService extends AccessibilityService implements
         Utils.recycleWindow(nextWindow);
 
         // To close the IME, we'll ask the FocusParkingView in the previous window to perform
-        // ACTION_COLLAPSE.
-        AccessibilityNodeInfo focusParkingView = findFocusParkingView(mFocusedNode);
-        if (focusParkingView == null) {
+        // ACTION_HIDE_IME.
+        AccessibilityNodeInfo fpv = mNavigator.findFocusParkingView(mFocusedNode);
+        if (fpv == null) {
             return;
         }
-        if (!focusParkingView.performAction(AccessibilityNodeInfo.ACTION_COLLAPSE)) {
+        if (!fpv.performAction(ACTION_HIDE_IME)) {
             L.w("Failed to close IME");
         }
-        focusParkingView.recycle();
-    }
-
-    /**
-     * Returns the FocusParkingView in the same window with the given {@code node}, or null if not
-     * found.
-     */
-    private AccessibilityNodeInfo findFocusParkingView(@NonNull AccessibilityNodeInfo node) {
-        AccessibilityWindowInfo window = node.getWindow();
-        if (window == null) {
-            L.w("Failed to get window of node: " + node);
-            return null;
-        }
-        AccessibilityNodeInfo fpv = mNavigator.findFocusParkingView(window);
-        if (fpv == null) {
-            L.e("No FocusParkingView in " + window);
-        }
-        window.recycle();
-        return fpv;
-    }
-
-    private void setScrollableContainer(@Nullable AccessibilityNodeInfo scrollableContainer) {
-        if ((mScrollableContainer == null && scrollableContainer == null)
-                || (mScrollableContainer != null
-                        && mScrollableContainer.equals(scrollableContainer))) {
-            return;
-        }
-
-        Utils.recycleNode(mScrollableContainer);
-        mScrollableContainer = copyNode(scrollableContainer);
+        fpv.recycle();
     }
 
     /**
@@ -1716,36 +1800,55 @@ public class RotaryService extends AccessibilityService implements
         }
         mIgnoreViewClickedNode = copyNode(node);
         if (node != null) {
-            mIgnoreViewClickedUntil = SystemClock.uptimeMillis() + mIgnoreViewClickedMs;
+            mLastViewClickedTime = SystemClock.uptimeMillis();
         }
     }
 
-    /**
-     * Sets {@link #mInRotaryMode}, toggling IMEs when the value changes and a rotary input method
-     * has been configured.
-     */
     private void setInRotaryMode(boolean inRotaryMode) {
         if (inRotaryMode == mInRotaryMode) {
             return;
         }
         mInRotaryMode = inRotaryMode;
-        if (mRotaryInputMethod.isEmpty()) {
+
+        // If we're controlling direct manipulation mode (i.e., the focused node supports rotate
+        // directly), exit the mode when the user touches the screen.
+        if (!inRotaryMode && mInDirectManipulationMode) {
+            if (mFocusedNode == null) {
+                L.e("mFocused is null in direct manipulation mode");
+            } else if (DirectManipulationHelper.supportRotateDirectly(mFocusedNode)) {
+                L.d("Exit direct manipulation mode on user touch");
+                mInDirectManipulationMode = false;
+                boolean result = mFocusedNode.performAction(ACTION_CLEAR_SELECTION);
+                if (!result) {
+                    L.w("Failed to perform ACTION_CLEAR_SELECTION on " + mFocusedNode);
+                }
+            } else {
+                L.d("The client app should exit direct manipulation mode");
+            }
+        }
+
+        // Update IME.
+        if (TextUtils.isEmpty(mRotaryInputMethod)) {
             L.w("No rotary IME configured");
+            return;
+        }
+        if (TextUtils.isEmpty(mTouchInputMethod)) {
+            L.w("No touch IME configured");
             return;
         }
         if (!inRotaryMode) {
             setEditNode(null);
         }
-        if (!inRotaryMode && mTouchInputMethod == null) {
-            L.w("Touch IME not observed");
+        // Switch to the rotary IME or the touch IME.
+        String newIme = inRotaryMode ? mRotaryInputMethod : mTouchInputMethod;
+        if (!isValidIme(newIme)) {
+            L.w("Invalid IME: " + newIme);
             return;
         }
-        // Switch to the rotary IME or the IME in use before we switched to the rotary IME.
-        String newIme = inRotaryMode ? mRotaryInputMethod : mTouchInputMethod;
         boolean result =
                 Settings.Secure.putString(getContentResolver(), DEFAULT_INPUT_METHOD, newIme);
         if (!result) {
-            L.w("Failed to switch IME: %s", newIme);
+            L.w("Failed to switch IME: " + newIme);
         }
     }
 
@@ -1794,39 +1897,18 @@ public class RotaryService extends AccessibilityService implements
             L.d("No need to focus on targetNode because it's already focused: " + targetNode);
             return true;
         }
-        if (targetNode.isFocused()) {
-            // This happens when:
-            // 1. A window has no FocusParkingView, thus leaving the window won't clear the view
-            //    focus in it. When going back to the window, we may find that the targetNode is
-            //    already focused. This is not allowed because we require a window must have a
-            //    FocusParkingView.
-            // 2. A window has a FocusParkingView as the first focusable view, and has a view with
-            //    android:focusedByDefault="true". When the currently focused view is removed,
-            //    Android will focus on the first focusable view (i.e., the FocusParkingView), which
-            //    fires a TYPE_VIEW_FOCUSED event. Because there is a focusedByDefault view, Android
-            //    then moves focus to it, which fires another TYPE_VIEW_FOCUSED event. When
-            //    receiving the first event (in onAutoFocusFocusParkingView()), we will find a view
-            //    nearby and try to focus it. The view we found might be the focusedByDefault view,
-            //    which was already focused by Android. This is fine, and we just need to update
-            //    mFocusedNode.
-            L.w("The focus on targetNode might not be cleared: " + targetNode);
-            setFocusedNode(targetNode);
-            return true;
-        }
-        if (mPendingFocusedNodes.contains(targetNode)) {
-            L.w("Don't focus on targetNode because we just tried to focus on it and are still "
-                    + "waiting for the focus event: " + targetNode);
-            return false;
-        }
-        if (!Utils.isFocusArea(targetNode) && Utils.hasFocus(targetNode)) {
+        boolean isInWebView = mNavigator.isInWebView(targetNode);
+        if (!Utils.isFocusArea(targetNode) && Utils.hasFocus(targetNode) && !isInWebView) {
             // One of targetNode's descendants is already focused, so we can't perform ACTION_FOCUS
             // on targetNode directly unless it's a FocusArea. The workaround is to clear the focus
-            // first (by focusing on the FocusParkingView), then focus on targetNode.
+            // first (by focusing on the FocusParkingView), then focus on targetNode. The
+            // prohibition on focusing a node that has focus doesn't apply in WebViews.
             L.d("One of targetNode's descendants is already focused: " + targetNode);
             if (!clearFocusInCurrentWindow()) {
                 return false;
             }
         }
+
         // Now we can perform ACTION_FOCUS on targetNode since it doesn't have focus, its
         // descendant's focus has been cleared, or it's a FocusArea.
         boolean result = targetNode.performAction(ACTION_FOCUS, arguments);
@@ -1834,15 +1916,40 @@ public class RotaryService extends AccessibilityService implements
             L.w("Failed to perform ACTION_FOCUS on node " + targetNode);
             return false;
         }
-        L.d("Performed focus on node " + targetNode);
+        L.d("Performed ACTION_FOCUS on node " + targetNode);
 
-        // Update the focused node and pending focused nodes.
-        // 1. If targetNode doesn't represent a FocusArea, targetNode is the focused node.
-        // 2. If targetNode represents a FocusArea, targetNode won't get focused. Instead, one of
-        //    its descendants will get focused and report a TYPE_VIEW_FOCUSED event. We'll update
-        //    the focused node properly when handling the event.
-        setFocusedNode(targetNode);
-        mPendingFocusedNodes.put(targetNode);
+        // If we performed ACTION_FOCUS on a FocusArea, find the descendant that was focused as a
+        // result.
+        if (Utils.isFocusArea(targetNode)) {
+            if (findFocusedNode(targetNode)) {
+                return true;
+            } else {
+                L.w("Unable to find focus after performing ACTION_FOCUS on a FocusArea");
+            }
+        }
+
+        // Update mFocusedNode and mPendingFocusedNode.
+        setFocusedNode(Utils.isFocusParkingView(targetNode) ? null : targetNode);
+        setPendingFocusedNode(targetNode);
+        return true;
+    }
+
+    /**
+     * Searches {@code node} and its descendants for the focused node. If found, sets
+     * {@link #mFocusedNode} and {@link #mPendingFocusedNode}. Returns whether the focus was found.
+     * This method should be called after performing an action which changes the focus where we
+     * can't predict which node will be focused.
+     */
+    private boolean findFocusedNode(@NonNull AccessibilityNodeInfo node) {
+        AccessibilityNodeInfo foundFocus = node.findFocus(FOCUS_INPUT);
+        if (foundFocus == null) {
+            L.w("Failed to find focused node in " + node);
+            return false;
+        }
+        L.d("Found focused node " + foundFocus);
+        setFocusedNode(foundFocus);
+        setPendingFocusedNode(foundFocus);
+        foundFocus.recycle();
         return true;
     }
 
@@ -1879,71 +1986,16 @@ public class RotaryService extends AccessibilityService implements
     }
 
     /**
-     * This method is called when Android focused a FocusParkingView (i.e. {@code fpv})
-     * automatically. It moves focus from the given {@code fpv} to a view within the same window,
-     * which is chosen in the following order:
-     * <ol>
-     *   <li> the previously focused view ({@link #mPreviousFocusedNode}), if any
-     *   <li> the default focus (app:defaultFocus) in the FocusArea that contains {@link
-     *        #mFocusedNode}, if any
-     *   <li> the first focusable view in the FocusArea that contains {@link #mFocusedNode}, if any,
-     *        excluding any FocusParkingViews
-     *   <li> the most recent focus in the window, if any, excluding any FocusParkingViews
-     *   <li> the default focus in the window, if any, excluding any FocusParkingViews
-     *   <li> the first focusable view in the window, if any, excluding any FocusParkingViews
-     * </ol>
+     * Checks if the {@code componentName} is an enabled input method.
+     * The string should be in the format {@code "PackageName/.ClassName"}.
+     * Example: {@code "com.android.inputmethod.latin/.CarLatinIME"}.
      */
-    private void onFocusParkingViewFocusedAutomatically(@NonNull AccessibilityNodeInfo fpv) {
-        int windowId = fpv.getWindowId();
-        mPreviousFocusedNode = Utils.refreshNode(mPreviousFocusedNode);
-        if (mPreviousFocusedNode != null && mPreviousFocusedNode.getWindowId() == windowId) {
-            boolean success = performFocusAction(mPreviousFocusedNode);
-            if (success) {
-                L.d("Move focus to the previously focused node");
-                return;
-            }
+    private boolean isValidIme(String componentName) {
+        if (TextUtils.isEmpty(componentName)) {
+            return false;
         }
-
-        mFocusArea = Utils.refreshNode(mFocusArea);
-        if (mFocusArea != null && mFocusArea.getWindowId() == windowId) {
-            Bundle bundle = new Bundle();
-            bundle.putInt(RotaryConstants.FOCUS_ACTION_TYPE, RotaryConstants.FOCUS_DEFAULT);
-            boolean success = performFocusAction(mFocusArea, bundle);
-            if (success) {
-                L.d("Move focus to the default focus of the current FocusArea");
-                return;
-            }
-
-            bundle.clear();
-            bundle.putInt(RotaryConstants.FOCUS_ACTION_TYPE, RotaryConstants.FOCUS_FIRST);
-            if (performFocusAction(mFocusArea, bundle)) {
-                L.d("Move focus to the first focusable view in the current FocusArea");
-                return;
-            }
-        }
-
-        if (focusOnMostRecentFocus()) {
-            L.d("Move focus to the last focused node in the window");
-            return;
-        }
-
-        if (fpv.performAction(ACTION_DISMISS)) {
-            L.d("Move focus to the default focus in the window");
-            return;
-        }
-        L.d("Try to focus on the first focusable view in the window");
-        focusFirstFocusDescendant();
-    }
-
-    /**
-     * This method is called when Android focused a non-FocusParkingView (i.e. {@code node})
-     * automatically. It updates {@link #mFocusedNode}.
-     */
-    private void onNodeFocusedAutomatically(@NonNull AccessibilityNodeInfo node) {
-        if (node.equals(mFocusedNode)) {
-            L.d("mFocusedNode was set before receiving focused event");
-            return;
-        }
-        setFocusedNode(node);
+        String enabledInputMethods = Settings.Secure.getString(
+                getContentResolver(), Settings.Secure.ENABLED_INPUT_METHODS);
+        return enabledInputMethods != null && enabledInputMethods.contains(componentName);
     }
 }

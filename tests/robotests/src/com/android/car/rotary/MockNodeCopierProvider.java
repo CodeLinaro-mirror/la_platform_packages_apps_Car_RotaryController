@@ -17,9 +17,22 @@ package com.android.car.rotary;
 
 import android.view.accessibility.AccessibilityNodeInfo;
 
-import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
-/** A function that takes an {@link AccessibilityNodeInfo} and returns a {@code boolean}. */
-interface NodePredicate {
-    boolean isTarget(@NonNull AccessibilityNodeInfo node);
+/** A class that can provide a mock {@link NodeCopier}. */
+class MockNodeCopierProvider {
+
+    private static final NodeCopier sNodeCopier = new NodeCopier() {
+        // NodeCopier#copyNode() doesn't work when passed a mock node, so we create the mock method
+        // which returns the passed node itself rather than a copy. As a result, nodes created by
+        // the mock method shouldn't be recycled.
+        @Override
+        AccessibilityNodeInfo copy(@Nullable AccessibilityNodeInfo node) {
+            return node;
+        }
+    };
+
+    static NodeCopier get() {
+        return sNodeCopier;
+    }
 }
