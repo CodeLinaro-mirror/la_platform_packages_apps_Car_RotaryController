@@ -70,6 +70,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Message;
 import android.os.SystemClock;
 import android.os.UserManager;
 import android.provider.Settings;
@@ -80,6 +81,7 @@ import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
@@ -140,6 +142,12 @@ public class RotaryService extends AccessibilityService implements
      */
     private static final int INVALID_NUDGE_DIRECTION = -1;
 
+    /**
+     * Message for timer indicating that the center button has been held down long enough to trigger
+     * a long-press.
+     */
+    private static final int MSG_LONG_PRESS = 1;
+
     private static final String SHARED_PREFS = "com.android.car.rotary.RotaryService";
     private static final String TOUCH_INPUT_METHOD_PREFIX = "TOUCH_INPUT_METHOD_";
 
@@ -152,7 +160,7 @@ public class RotaryService extends AccessibilityService implements
     @Nullable private static WeakReference<Context> sWindowContext;
 
     @NonNull
-    private NodeCopier mNodeCopier = new NodeCopier();
+    private final NodeCopier mNodeCopier = new NodeCopier();
 
     private Navigator mNavigator;
 
@@ -303,10 +311,25 @@ public class RotaryService extends AccessibilityService implements
     private long mLastRotateEventTime;
 
     /**
-     * The repeat count of {@link KeyEvent#KEYCODE_DPAD_CENTER}. Use to prevent processing a center
-     * button click when the center button is released after a long press.
+     * How many milliseconds the center buttons must be held down before a long-press is triggered.
+     * This doesn't apply to the application window.
      */
-    private int mCenterButtonRepeatCount;
+    private long mLongPressMs;
+
+    /**
+     * Whether the center button was held down long enough to trigger a long-press. In this case, a
+     * click won't be triggered when the center button is released.
+     */
+    private boolean mLongPressTriggered;
+
+    private final Handler mHandler = new Handler(Looper.getMainLooper()) {
+        @Override
+        public void handleMessage(@NonNull Message msg) {
+            if (msg.what == MSG_LONG_PRESS) {
+                handleCenterButtonLongPressEvent();
+            }
+        }
+    };
 
     /**
      * A context to use for fetching the {@link WindowManager} and creating the touch overlay or
@@ -416,6 +439,11 @@ public class RotaryService extends AccessibilityService implements
         }
 
         mAfterFocusTimeoutMs = res.getInteger(R.integer.after_focus_timeout_ms);
+
+        mLongPressMs = res.getInteger(R.integer.long_press_ms);
+        if (mLongPressMs == 0) {
+            mLongPressMs = ViewConfiguration.getLongPressTimeout();
+        }
     }
 
     /**
@@ -740,17 +768,11 @@ public class RotaryService extends AccessibilityService implements
                 handleNudgeEvent(View.FOCUS_DOWN, action);
                 return true;
             case KeyEvent.KEYCODE_DPAD_CENTER:
-                if (isActionDown) {
-                    mCenterButtonRepeatCount = event.getRepeatCount();
+                // Ignore repeat events. We only care about the initial ACTION_DOWN and the final
+                // ACTION_UP events.
+                if (event.getRepeatCount() == 0) {
+                    handleCenterButtonEvent(action);
                 }
-                if (mCenterButtonRepeatCount == 0) {
-                    handleCenterButtonEvent(action, /* longClick= */ false);
-                } else if (mCenterButtonRepeatCount == 1) {
-                    handleCenterButtonEvent(action, /* longClick= */ true);
-                }
-                return true;
-            case KeyEvent.KEYCODE_G:
-                handleCenterButtonEvent(action, /* longClick= */ true);
                 return true;
             case KeyEvent.KEYCODE_BACK:
                 if (mInDirectManipulationMode) {
@@ -919,13 +941,13 @@ public class RotaryService extends AccessibilityService implements
         if (type != null) {
             mWindowCache.remove(windowId);
             // No longer need to keep track of the node being edited if the IME window was closed.
-            if (type.intValue() == TYPE_INPUT_METHOD) {
+            if (type == TYPE_INPUT_METHOD) {
                 setEditNode(null);
             }
             // No need to restore the focus if it's an application window. When an application
             // window is removed, another window will gain focus shortly and the FocusParkingView
             // in that window will restore the focus.
-            if (type.intValue() == TYPE_APPLICATION) {
+            if (type == TYPE_APPLICATION) {
                 return;
             }
         } else {
@@ -1059,7 +1081,7 @@ public class RotaryService extends AccessibilityService implements
     }
 
     /** Handles controller center button event. */
-    private void handleCenterButtonEvent(int action, boolean longClick) {
+    private void handleCenterButtonEvent(int action) {
         if (!isValidAction(action)) {
             return;
         }
@@ -1095,19 +1117,39 @@ public class RotaryService extends AccessibilityService implements
             return;
         }
 
-        // Case 3: the focus node doesn't support rotate directly and it's not in application window
-        // (e.g., in system window). We should ignore ACTION_DOWN event, and click or long click
-        // the focused node on ACTION_UP event.
+        // Case 3: the focused node doesn't support rotate directly and it's not in the
+        // application window (e.g., it's in a system window). We start a timer on the
+        // ACTION_DOWN event. If the ACTION_UP event occurs before the timeout, we perform
+        // ACTION_CLICK on the focused node and abort the timer. If the timer times out before
+        // the ACTION_UP event, handleCenterButtonLongPressEvent() will perform ACTION_LONG_CLICK
+        // on the focused node and we'll ignore the subsequent ACTION_UP event.
         if (action == ACTION_DOWN) {
+            mLongPressTriggered = false;
+            mHandler.removeMessages(MSG_LONG_PRESS);
+            mHandler.sendEmptyMessageDelayed(MSG_LONG_PRESS, mLongPressMs);
             return;
         }
-        boolean result = mFocusedNode.performAction(longClick ? ACTION_LONG_CLICK : ACTION_CLICK);
-        if (!result) {
-            L.w("Failed to perform " + (longClick ? "ACTION_LONG_CLICK" : "ACTION_CLICK")
-                    + " on " + mFocusedNode);
+        if (mLongPressTriggered) {
+            mLongPressTriggered = false;
+            return;
         }
-        if (!longClick) {
-            setIgnoreViewClickedNode(mFocusedNode);
+        mHandler.removeMessages(MSG_LONG_PRESS);
+        boolean result = mFocusedNode.performAction(ACTION_CLICK);
+        if (!result) {
+            L.w("Failed to perform ACTION_CLICK on " + mFocusedNode);
+        }
+        setIgnoreViewClickedNode(mFocusedNode);
+    }
+
+    /** Handles controller center button long-press events. */
+    private void handleCenterButtonLongPressEvent() {
+        mLongPressTriggered = true;
+        if (initFocus()) {
+            return;
+        }
+        boolean result = mFocusedNode.performAction(ACTION_LONG_CLICK);
+        if (!result) {
+            L.w("Failed to perform ACTION_LONG_CLICK on " + mFocusedNode);
         }
     }
 
@@ -1153,31 +1195,22 @@ public class RotaryService extends AccessibilityService implements
 
         // If the focused node is not in direct manipulation mode, try to move the focus to another
         // node.
-        boolean success = nudgeTo(windows, direction);
+        nudgeTo(windows, direction);
         Utils.recycleWindows(windows);
-
-        // If the user is nudging out of the IME to the node being edited, we no longer need
-        // to keep track of the node being edited.
-        if (success) {
-            mEditNode = Utils.refreshNode(mEditNode);
-            if (mEditNode != null && mEditNode.isFocused()) {
-                setEditNode(null);
-            }
-        }
     }
 
-    private boolean nudgeTo(@NonNull List<AccessibilityWindowInfo> windows, int direction) {
+    private void nudgeTo(@NonNull List<AccessibilityWindowInfo> windows, int direction) {
         // If the HUN is in the nudge direction, nudge to it.
         boolean hunFocusResult = focusHunsWindow(windows, direction);
         if (hunFocusResult) {
             L.d("Nudge to HUN successful");
-            return true;
+            return;
         }
 
         // Try to move the focus to the shortcut node.
         if (mFocusArea == null) {
             L.e("mFocusArea shouldn't be null");
-            return false;
+            return;
         }
         Bundle arguments = new Bundle();
         arguments.putInt(NUDGE_DIRECTION, direction);
@@ -1188,7 +1221,7 @@ public class RotaryService extends AccessibilityService implements
                 findFocusedNode(root);
                 root.recycle();
             }
-            return true;
+            return;
         }
 
         // No shortcut node, so move the focus in the given direction.
@@ -1202,7 +1235,7 @@ public class RotaryService extends AccessibilityService implements
                 findFocusedNode(root);
                 root.recycle();
             }
-            return true;
+            return;
         }
 
         // No specified FocusArea or cached FocusArea in the direction, so mFocusArea doesn't know
@@ -1211,8 +1244,35 @@ public class RotaryService extends AccessibilityService implements
                 mNavigator.findNudgeTargetFocusArea(windows, mFocusedNode, mFocusArea, direction);
         if (targetFocusArea == null) {
             L.d("Failed to find a target FocusArea for the nudge");
-            return false;
+            return;
         }
+
+        // If the user is nudging out of the IME, set mFocusedNode to the node being edited (which
+        // should already be focused) and hide the IME.
+        if (mEditNode != null && mFocusArea.getWindowId() != targetFocusArea.getWindowId()) {
+            AccessibilityWindowInfo fromWindow = mFocusArea.getWindow();
+            if (fromWindow != null && fromWindow.getType() == TYPE_INPUT_METHOD) {
+                setFocusedNode(mEditNode);
+                L.d("Returned to node being edited");
+                // Ask the FocusParkingView to hide the IME.
+                AccessibilityNodeInfo fpv = mNavigator.findFocusParkingView(mEditNode);
+                if (fpv != null) {
+                    if (!fpv.performAction(ACTION_HIDE_IME)) {
+                        L.w("Failed to close IME");
+                    }
+                    fpv.recycle();
+                }
+                setEditNode(null);
+                Utils.recycleWindow(fromWindow);
+                targetFocusArea.recycle();
+                return;
+            }
+            Utils.recycleWindow(fromWindow);
+        }
+
+        // targetFocusArea is an explicit FocusArea (i.e., an instance of the FocusArea class), so
+        // perform ACTION_FOCUS on it. The FocusArea will handle this by focusing one of its
+        // descendants.
         if (Utils.isFocusArea(targetFocusArea)) {
             arguments.clear();
             arguments.putInt(NUDGE_DIRECTION, direction);
@@ -1220,7 +1280,7 @@ public class RotaryService extends AccessibilityService implements
             L.d("Nudging to the nearest FocusArea "
                     + (success ? "succeeded" : "failed: " + targetFocusArea));
             targetFocusArea.recycle();
-            return success;
+            return;
         }
 
         // targetFocusArea is an implicit FocusArea (i.e., the root node of a window without any
@@ -1229,7 +1289,6 @@ public class RotaryService extends AccessibilityService implements
         L.d("Nudging to the nearest implicit focus area "
                 + (success ? "succeeded" : "failed: " + targetFocusArea));
         targetFocusArea.recycle();
-        return success;
     }
 
     private void handleRotaryEvent(RotaryEvent rotaryEvent) {
@@ -1478,20 +1537,20 @@ public class RotaryService extends AccessibilityService implements
         }
     }
 
-    private boolean injectKeyEventForDirection(int direction, int action) {
+    private void injectKeyEventForDirection(int direction, int action) {
         Integer keyCode = DIRECTION_TO_KEYCODE_MAP.get(direction);
         if (keyCode == null) {
             throw new IllegalArgumentException("direction must be one of "
                     + "{FOCUS_UP, FOCUS_DOWN, FOCUS_LEFT, FOCUS_RIGHT}.");
         }
-        return injectKeyEvent(keyCode, action);
+        injectKeyEvent(keyCode, action);
     }
 
-    private boolean injectKeyEvent(int keyCode, int action) {
+    private void injectKeyEvent(int keyCode, int action) {
         long upTime = SystemClock.uptimeMillis();
         KeyEvent keyEvent = new KeyEvent(
                 /* downTime= */ upTime, /* eventTime= */ upTime, action, keyCode, /* repeat= */ 0);
-        return mInputManager.injectInputEvent(keyEvent, InputManager.INJECT_INPUT_EVENT_MODE_ASYNC);
+        mInputManager.injectInputEvent(keyEvent, InputManager.INJECT_INPUT_EVENT_MODE_ASYNC);
     }
 
     /**
@@ -1559,7 +1618,7 @@ public class RotaryService extends AccessibilityService implements
 
         // If we were not in rotary mode before and we can focus the HUNs window for the given
         // nudge, focus the window and ensure that there is no previously touched node.
-        if (!prevInRotaryMode && windows != null && focusHunsWindow(windows, direction)) {
+        if (!prevInRotaryMode && focusHunsWindow(windows, direction)) {
             setLastTouchedNode(null);
             return true;
         }
