@@ -23,6 +23,7 @@ import static android.view.KeyEvent.ACTION_DOWN;
 import static android.view.KeyEvent.ACTION_UP;
 import static android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
 import static android.view.WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH;
+import static android.view.WindowManager.LayoutParams.PRIVATE_FLAG_TRUSTED_OVERLAY;
 import static android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
 import static android.view.accessibility.AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED;
 import static android.view.accessibility.AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED;
@@ -62,6 +63,7 @@ import android.content.SharedPreferences;
 import android.content.res.Resources;
 import android.database.ContentObserver;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.hardware.display.DisplayManager;
 import android.hardware.input.InputManager;
 import android.os.Build;
@@ -89,6 +91,7 @@ import androidx.annotation.Nullable;
 
 import com.android.car.ui.utils.DirectManipulationHelper;
 
+import java.lang.ref.WeakReference;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -139,6 +142,14 @@ public class RotaryService extends AccessibilityService implements
 
     private static final String SHARED_PREFS = "com.android.car.rotary.RotaryService";
     private static final String TOUCH_INPUT_METHOD_PREFIX = "TOUCH_INPUT_METHOD_";
+
+    /**
+     * A reference to {@link #mWindowContext} or null if one hasn't been created. This is static in
+     * order to prevent the creation of multiple window contexts when this service is enabled and
+     * disabled repeatedly. Android imposes a limit on the number of window contexts without a
+     * corresponding surface.
+     */
+    @Nullable private static WeakReference<Context> sWindowContext;
 
     @NonNull
     private NodeCopier mNodeCopier = new NodeCopier();
@@ -297,7 +308,11 @@ public class RotaryService extends AccessibilityService implements
      */
     private int mCenterButtonRepeatCount;
 
-    private Context mWindowContext;
+    /**
+     * A context to use for fetching the {@link WindowManager} and creating the touch overlay or
+     * null if one hasn't been created yet.
+     */
+    @Nullable private Context mWindowContext;
 
     private static final Map<Integer, Integer> TEST_TO_REAL_KEYCODE_MAP;
 
@@ -365,7 +380,9 @@ public class RotaryService extends AccessibilityService implements
                 res.getDimensionPixelSize(R.dimen.notification_headsup_card_margin_horizontal);
         int hunLeft = hunMarginHorizontal;
         WindowManager windowManager = getSystemService(WindowManager.class);
-        int displayWidth = windowManager.getCurrentWindowMetrics().getBounds().width();
+        Rect displayBounds = windowManager.getCurrentWindowMetrics().getBounds();
+        int displayWidth = displayBounds.width();
+        int displayHeight = displayBounds.height();
         int hunRight = displayWidth - hunMarginHorizontal;
         boolean showHunOnBottom = res.getBoolean(R.bool.config_showHeadsUpNotificationOnBottom);
         mHunNudgeDirection = showHunOnBottom ? View.FOCUS_DOWN : View.FOCUS_UP;
@@ -374,7 +391,7 @@ public class RotaryService extends AccessibilityService implements
         mIgnoreViewClickedMs = res.getInteger(R.integer.ignore_view_clicked_ms);
         mAfterScrollTimeoutMs = res.getInteger(R.integer.after_scroll_timeout_ms);
 
-        mNavigator = new Navigator(hunLeft, hunRight, showHunOnBottom);
+        mNavigator = new Navigator(displayWidth, displayHeight, hunLeft, hunRight, showHunOnBottom);
 
         mPrefs = createDeviceProtectedStorageContext().getSharedPreferences(SHARED_PREFS,
                 Context.MODE_PRIVATE);
@@ -432,10 +449,11 @@ public class RotaryService extends AccessibilityService implements
                     if (ready) {
                         mCarInputManager =
                                 (CarInputManager) mCar.getCarManager(Car.CAR_INPUT_SERVICE);
-                        mCarInputManager.requestInputEventCapture(this,
+                        mCarInputManager.requestInputEventCapture(
                                 CarOccupantZoneManager.DISPLAY_TYPE_MAIN,
                                 mInputTypes,
-                                CarInputManager.CAPTURE_REQ_FLAGS_ALLOW_DELAYED_GRANT);
+                                CarInputManager.CAPTURE_REQ_FLAGS_ALLOW_DELAYED_GRANT,
+                                /* callback= */ this);
                     }
                 });
 
@@ -567,13 +585,20 @@ public class RotaryService extends AccessibilityService implements
     }
 
     private Context getWindowContext() {
+        if (mWindowContext == null && sWindowContext != null) {
+            mWindowContext = sWindowContext.get();
+            if (mWindowContext != null) {
+                L.d("Reusing window context");
+            }
+        }
         if (mWindowContext == null) {
             // We need to set the display before creating the WindowContext.
             DisplayManager displayManager = getSystemService(DisplayManager.class);
             Display primaryDisplay = displayManager.getDisplay(DEFAULT_DISPLAY);
             updateDisplay(primaryDisplay.getDisplayId());
-
+            L.d("Creating window context");
             mWindowContext = createWindowContext(TYPE_APPLICATION_OVERLAY, null);
+            sWindowContext = new WeakReference<>(mWindowContext);
         }
         return mWindowContext;
     }
@@ -611,6 +636,7 @@ public class RotaryService extends AccessibilityService implements
                 FLAG_NOT_FOCUSABLE | FLAG_WATCH_OUTSIDE_TOUCH,
                 PixelFormat.TRANSPARENT);
         windowLayoutParams.gravity = Gravity.RIGHT | Gravity.TOP;
+        windowLayoutParams.privateFlags |= PRIVATE_FLAG_TRUSTED_OVERLAY;
         WindowManager windowManager = getSystemService(WindowManager.class);
         windowManager.addView(frameLayout, windowLayoutParams);
     }
@@ -884,7 +910,7 @@ public class RotaryService extends AccessibilityService implements
     /**
      * Handles a {@link AccessibilityEvent#TYPE_WINDOWS_CHANGED} event indicating that a window was
      * removed. Attempts to restore the most recent focus when the window containing
-     * {@link #mFocusedNode} is removed.
+     * {@link #mFocusedNode} is not an application window and it's removed.
      */
     private void handleWindowRemovedEvent(@NonNull AccessibilityEvent event) {
         int windowId = event.getWindowId();
@@ -895,6 +921,12 @@ public class RotaryService extends AccessibilityService implements
             // No longer need to keep track of the node being edited if the IME window was closed.
             if (type.intValue() == TYPE_INPUT_METHOD) {
                 setEditNode(null);
+            }
+            // No need to restore the focus if it's an application window. When an application
+            // window is removed, another window will gain focus shortly and the FocusParkingView
+            // in that window will restore the focus.
+            if (type.intValue() == TYPE_APPLICATION) {
+                return;
             }
         } else {
             L.w("No window type found in cache for window ID: " + windowId);
@@ -985,20 +1017,15 @@ public class RotaryService extends AccessibilityService implements
 
         if (fpv == null) {
             L.e("No FocusParkingView in the window containing " + node);
-            return false;
-        }
-
-        if (Utils.isCarUiFocusParkingView(fpv)) {
-            boolean result = fpv.performAction(ACTION_RESTORE_DEFAULT_FOCUS);
+        } else if (Utils.isCarUiFocusParkingView(fpv)
+                    && fpv.performAction(ACTION_RESTORE_DEFAULT_FOCUS)) {
             fpv.recycle();
-            if (result) {
-                findFocusedNode(node);
-            }
-            return result;
+            findFocusedNode(node);
+            return true;
         }
+        Utils.recycleNode(fpv);
 
-        AccessibilityWindowInfo window = fpv.getWindow();
-        fpv.recycle();
+        AccessibilityWindowInfo window = node.getWindow();
         if (window == null) {
             L.e("No window found for the generic FocusParkingView");
             return false;
@@ -1141,16 +1168,10 @@ public class RotaryService extends AccessibilityService implements
 
     private boolean nudgeTo(@NonNull List<AccessibilityWindowInfo> windows, int direction) {
         // If the HUN is in the nudge direction, nudge to it.
-        AccessibilityNodeInfo hunFocusArea =
-                mNavigator.findHunFocusArea(windows, mFocusedNode, direction);
-        boolean success;
-        if (hunFocusArea != null) {
-            success = performFocusAction(hunFocusArea);
-            L.d(success ? "Nudge to HUN" : " Failed to nudge to HUN " + hunFocusArea);
-            hunFocusArea.recycle();
-            if (success) {
-                return true;
-            }
+        boolean hunFocusResult = focusHunsWindow(windows, direction);
+        if (hunFocusResult) {
+            L.d("Nudge to HUN successful");
+            return true;
         }
 
         // Try to move the focus to the shortcut node.
@@ -1195,7 +1216,7 @@ public class RotaryService extends AccessibilityService implements
         if (Utils.isFocusArea(targetFocusArea)) {
             arguments.clear();
             arguments.putInt(NUDGE_DIRECTION, direction);
-            success = performFocusAction(targetFocusArea, arguments);
+            boolean success = performFocusAction(targetFocusArea, arguments);
             L.d("Nudging to the nearest FocusArea "
                     + (success ? "succeeded" : "failed: " + targetFocusArea));
             targetFocusArea.recycle();
@@ -1204,7 +1225,7 @@ public class RotaryService extends AccessibilityService implements
 
         // targetFocusArea is an implicit FocusArea (i.e., the root node of a window without any
         // FocusAreas), so restore the focus in it.
-        success = restoreDefaultFocus(targetFocusArea);
+        boolean success = restoreDefaultFocus(targetFocusArea);
         L.d("Nudging to the nearest implicit focus area "
                 + (success ? "succeeded" : "failed: " + targetFocusArea));
         targetFocusArea.recycle();
