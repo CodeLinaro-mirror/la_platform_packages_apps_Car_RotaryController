@@ -2310,13 +2310,13 @@ public class RotaryService extends AccessibilityService implements
     /** Switches to the rotary IME or the touch IME if needed. */
     private void updateIme() {
         String newIme = mInRotaryMode ? mRotaryInputMethod : mTouchInputMethod;
+        if (mInRotaryMode && !isValidIme(newIme)) {
+            L.w("Rotary IME doesn't exist: " + newIme);
+            return;
+        }
         String oldIme = getCurrentIme();
         if (oldIme.equals(newIme)) {
             L.v("No need to switch IME: " + newIme);
-            return;
-        }
-        if (mInRotaryMode && !isValidIme(newIme)) {
-            L.w("Rotary IME doesn't exist: " + newIme);
             return;
         }
         setCurrentIme(newIme);
