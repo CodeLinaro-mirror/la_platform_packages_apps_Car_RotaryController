@@ -2016,12 +2016,7 @@ public class RotaryService extends AccessibilityService implements
      */
     private void maybeClearFocusInCurrentWindow(@Nullable AccessibilityNodeInfo targetFocus) {
         mFocusedNode = Utils.refreshNode(mFocusedNode);
-        if (mFocusedNode == null
-                // No need to clear focus if mFocusedNode is not focused. However, when it's a node
-                // in a WebView, its state might not be up to date, so mFocusedNode.isFocused()
-                // may return false even if the view represented by mFocusedNode is focused.
-                // So don't check the focused state if it's in WebView.
-                || (!mFocusedNode.isFocused() && !mNavigator.isInWebView(mFocusedNode))
+        if (mFocusedNode == null || !mFocusedNode.isFocused()
                 || (targetFocus != null
                         && mFocusedNode.getWindowId() == targetFocus.getWindowId())) {
             return;
