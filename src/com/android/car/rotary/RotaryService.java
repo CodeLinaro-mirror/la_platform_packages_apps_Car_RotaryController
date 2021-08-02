@@ -17,6 +17,7 @@ package com.android.car.rotary;
 
 import static android.accessibilityservice.AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
 import static android.car.CarOccupantZoneManager.DisplayTypeEnum;
+import static android.car.settings.CarSettings.Secure.KEY_ROTARY_KEY_EVENT_FILTER;
 import static android.provider.Settings.Secure.DEFAULT_INPUT_METHOD;
 import static android.provider.Settings.Secure.DISABLED_SYSTEM_INPUT_METHODS;
 import static android.provider.Settings.Secure.ENABLED_INPUT_METHODS;
@@ -47,6 +48,8 @@ import static android.view.accessibility.AccessibilityNodeInfo.AccessibilityActi
 import static android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION;
 import static android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD;
 
+import static com.android.car.internal.ExcludeFromCodeCoverageGeneratedReport.BOILERPLATE_CODE;
+import static com.android.car.internal.ExcludeFromCodeCoverageGeneratedReport.DUMP_INFO;
 import static com.android.car.ui.utils.RotaryConstants.ACTION_HIDE_IME;
 import static com.android.car.ui.utils.RotaryConstants.ACTION_NUDGE_SHORTCUT;
 import static com.android.car.ui.utils.RotaryConstants.ACTION_NUDGE_TO_ANOTHER_FOCUS_AREA;
@@ -102,6 +105,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 
+import com.android.car.internal.ExcludeFromCodeCoverageGeneratedReport;
 import com.android.car.ui.utils.DirectManipulationHelper;
 import com.android.internal.util.ArrayUtils;
 import com.android.internal.util.dump.DualDumpOutputStream;
@@ -321,6 +325,9 @@ public class RotaryService extends AccessibilityService implements
     /** Observer to update {@link #mTouchInputMethod} when the user switches IMEs. */
     private ContentObserver mInputMethodObserver;
 
+    /** Observer to update service info when the developer toggles key event filtering. */
+    private ContentObserver mKeyEventFilterObserver;
+
     private SharedPreferences mPrefs;
     private UserManager mUserManager;
 
@@ -441,6 +448,11 @@ public class RotaryService extends AccessibilityService implements
      */
     @Nullable private Context mWindowContext;
 
+    /**
+     * Mapping from test keycodes to production keycodes. During development, you can use a USB
+     * keyboard as a stand-in for rotary hardware. To enable this: {@code adb shell settings put
+     * secure android.car.ROTARY_KEY_EVENT_FILTER 1}.
+     */
     private static final Map<Integer, Integer> TEST_TO_REAL_KEYCODE_MAP;
 
     private static final Map<Integer, Integer> DIRECTION_TO_KEYCODE_MAP;
@@ -694,12 +706,7 @@ public class RotaryService extends AccessibilityService implements
                     }
                 });
 
-        if (Build.IS_DEBUGGABLE) {
-            AccessibilityServiceInfo serviceInfo = getServiceInfo();
-            // Filter testing KeyEvents from a keyboard.
-            serviceInfo.flags |= FLAG_REQUEST_FILTER_KEY_EVENTS;
-            setServiceInfo(serviceInfo);
-        }
+        updateServiceInfo();
 
         mInputManager = getSystemService(InputManager.class);
 
@@ -708,6 +715,10 @@ public class RotaryService extends AccessibilityService implements
 
         // Register an observer to update mTouchInputMethod whenever the user switches IMEs.
         registerInputMethodObserver();
+
+        // Register an observer to update the service info when the developer changes the filter
+        // setting.
+        registerFilterObserver();
     }
 
     @Override
@@ -721,6 +732,7 @@ public class RotaryService extends AccessibilityService implements
         getWindowContext().unregisterReceiver(mHomeButtonReceiver);
 
         unregisterInputMethodObserver();
+        unregisterFilterObserver();
         if (mCarInputManager != null) {
             mCarInputManager.releaseInputEventCapture(CarOccupantZoneManager.DISPLAY_TYPE_MAIN);
         }
@@ -908,6 +920,30 @@ public class RotaryService extends AccessibilityService implements
     }
 
     /**
+     * Updates this accessibility service's info, enabling or disabling key event filtering
+     * depending on a setting.
+     */
+    private void updateServiceInfo() {
+        AccessibilityServiceInfo serviceInfo = getServiceInfo();
+        if (serviceInfo == null) {
+            L.w("Service info not available");
+            return;
+        }
+        int flags = serviceInfo.flags;
+        boolean filterKeyEvents = Settings.Secure.getInt(getContentResolver(),
+                KEY_ROTARY_KEY_EVENT_FILTER, /* def= */ 0) != 0;
+        if (filterKeyEvents) {
+            flags |= FLAG_REQUEST_FILTER_KEY_EVENTS;
+        } else {
+            flags &= ~FLAG_REQUEST_FILTER_KEY_EVENTS;
+        }
+        if (flags == serviceInfo.flags) return;
+        L.d((filterKeyEvents ? "Enabling" : "Disabling") + " key event filtering");
+        serviceInfo.flags = flags;
+        setServiceInfo(serviceInfo);
+    }
+
+    /**
      * Registers an observer to updates {@link #mTouchInputMethod} whenever the user switches IMEs.
      */
     private void registerInputMethodObserver() {
@@ -941,6 +977,34 @@ public class RotaryService extends AccessibilityService implements
         if (mInputMethodObserver != null) {
             getContentResolver().unregisterContentObserver(mInputMethodObserver);
             mInputMethodObserver = null;
+        }
+    }
+
+    /**
+     * Registers an observer to update our accessibility service info whenever the developer changes
+     * the key event filter setting.
+     */
+    private void registerFilterObserver() {
+        if (mKeyEventFilterObserver != null) {
+            throw new IllegalStateException("Filter observer already registered");
+        }
+        mKeyEventFilterObserver = new ContentObserver(new Handler(Looper.myLooper())) {
+            @Override
+            public void onChange(boolean selfChange) {
+                updateServiceInfo();
+            }
+        };
+        getContentResolver().registerContentObserver(
+                Settings.Secure.getUriFor(KEY_ROTARY_KEY_EVENT_FILTER),
+                /* notifyForDescendants= */ false,
+                mKeyEventFilterObserver);
+    }
+
+    /** Unregisters the observer registered by {@link #registerFilterObserver}. */
+    private void unregisterFilterObserver() {
+        if (mKeyEventFilterObserver != null) {
+            getContentResolver().unregisterContentObserver(mKeyEventFilterObserver);
+            mKeyEventFilterObserver = null;
         }
     }
 
@@ -1652,8 +1716,8 @@ public class RotaryService extends AccessibilityService implements
         }
         boolean clockwise = rotaryEvent.isClockwise();
         int count = rotaryEvent.getNumberOfClicks();
-        // TODO(b/153195148): Use the first eventTime for now. We'll need to improve it later.
-        long eventTime = rotaryEvent.getUptimeMillisForClick(0);
+        // TODO(b/153195148): Use the last eventTime for now. We'll need to improve it later.
+        long eventTime = rotaryEvent.getUptimeMillisForClick(count - 1);
         handleRotateEvent(clockwise, count, eventTime);
     }
 
@@ -2449,6 +2513,13 @@ public class RotaryService extends AccessibilityService implements
         return true;
     }
 
+    @ExcludeFromCodeCoverageGeneratedReport(reason = BOILERPLATE_CODE)
+    @VisibleForTesting
+    void setRotateAcceleration(int rotationAcceleration2xMs, int rotationAcceleration3xMs) {
+        mRotationAcceleration2xMs = rotationAcceleration2xMs;
+        mRotationAcceleration3xMs = rotationAcceleration3xMs;
+    }
+
     /**
      * Returns the number of "ticks" to rotate for a single rotate event with the given detent
      * {@code count} at the given time. Uses and updates {@link #mLastRotateEventTime}. The result
@@ -2536,6 +2607,7 @@ public class RotaryService extends AccessibilityService implements
         mInputManager = inputManager;
     }
 
+    @ExcludeFromCodeCoverageGeneratedReport(reason = DUMP_INFO)
     @Override
     protected void dump(@NonNull FileDescriptor fd, @NonNull PrintWriter writer,
             @Nullable String[] args) {
