@@ -46,6 +46,7 @@ import static android.view.accessibility.AccessibilityNodeInfo.AccessibilityActi
 import static android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION;
 import static android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD;
 
+import static com.android.car.ui.utils.RotaryConstants.ACTION_DISMISS_POPUP_WINDOW;
 import static com.android.car.ui.utils.RotaryConstants.ACTION_HIDE_IME;
 import static com.android.car.ui.utils.RotaryConstants.ACTION_NUDGE_SHORTCUT;
 import static com.android.car.ui.utils.RotaryConstants.ACTION_NUDGE_TO_ANOTHER_FOCUS_AREA;
@@ -583,6 +584,7 @@ public class RotaryService extends AccessibilityService implements
 
     @Override
     public void onCreate() {
+        L.v("onCreate");
         super.onCreate();
         Resources res = getResources();
         mRotationAcceleration3xMs = res.getInteger(R.integer.rotation_acceleration_3x_ms);
@@ -682,6 +684,7 @@ public class RotaryService extends AccessibilityService implements
 
     @Override
     public void onServiceConnected() {
+        L.v("onServiceConnected");
         super.onServiceConnected();
 
         mCar = Car.createCar(this, null, Car.CAR_WAIT_TIMEOUT_WAIT_FOREVER,
@@ -719,6 +722,7 @@ public class RotaryService extends AccessibilityService implements
 
     @Override
     public void onDestroy() {
+        L.v("onDestroy");
         unregisterReceiver(mAppInstallUninstallReceiver);
         getWindowContext().unregisterReceiver(mHomeButtonReceiver);
 
@@ -804,6 +808,7 @@ public class RotaryService extends AccessibilityService implements
      */
     @Override
     protected boolean onKeyEvent(KeyEvent event) {
+        L.v("onKeyEvent " + event);
         if (Build.IS_DEBUGGABLE) {
             return handleKeyEvent(event);
         }
@@ -818,9 +823,11 @@ public class RotaryService extends AccessibilityService implements
     @Override
     public void onKeyEvents(int targetDisplayId, List<KeyEvent> events) {
         if (!isValidDisplayId(targetDisplayId)) {
+            L.w("Invalid display ID " + targetDisplayId);
             return;
         }
         for (KeyEvent event : events) {
+            L.v("onKeyEvents " + event);
             handleKeyEvent(event);
         }
     }
@@ -832,9 +839,11 @@ public class RotaryService extends AccessibilityService implements
     @Override
     public void onRotaryEvents(int targetDisplayId, List<RotaryEvent> events) {
         if (!isValidDisplayId(targetDisplayId)) {
+            L.w("Invalid display ID " + targetDisplayId);
             return;
         }
         for (RotaryEvent rotaryEvent : events) {
+            L.v("onRotaryEvents " + rotaryEvent);
             handleRotaryEvent(rotaryEvent);
         }
     }
@@ -1489,6 +1498,7 @@ public class RotaryService extends AccessibilityService implements
         // If there is no non-FocusParkingView focused, execute the off-screen nudge action, if
         // specified.
         if (mFocusedNode == null) {
+            L.d("mFocusedNode is null");
             handleOffScreenNudge(direction);
             return;
         }
@@ -1536,9 +1546,37 @@ public class RotaryService extends AccessibilityService implements
         AccessibilityNodeInfo targetFocusArea =
                 mNavigator.findNudgeTargetFocusArea(windows, mFocusedNode, mFocusArea, direction);
 
-        // If the user is nudging off the edge of the screen, execute the off-screen nudge action,
-        // if specified.
         if (targetFocusArea == null) {
+            L.d("Failed to find nearest FocusArea for nudge");
+
+            // If the user is nudging out of a dismissible popup window, perform
+            // ACTION_DISMISS_POPUP_WINDOW to dismiss it.
+            AccessibilityWindowInfo sourceWindow = mFocusArea.getWindow();
+            if (sourceWindow != null) {
+                Rect sourceBounds = new Rect();
+                sourceWindow.getBoundsInScreen(sourceBounds);
+                if (mNavigator.isDismissible(sourceWindow, sourceBounds, direction)) {
+                    AccessibilityNodeInfo fpv = mNavigator.findFocusParkingView(mFocusedNode);
+                    if (fpv != null) {
+                        if (fpv.performAction(ACTION_DISMISS_POPUP_WINDOW)) {
+                            L.v("Performed ACTION_DISMISS_POPUP_WINDOW successfully");
+                            fpv.recycle();
+                            sourceWindow.recycle();
+                            return;
+                        } else {
+                            L.v("The overlay window doesn't support dismissing by nudging "
+                                    + sourceBounds);
+                        }
+                        fpv.recycle();
+                    } else {
+                        L.e("No FocusParkingView in " + sourceWindow);
+                    }
+                }
+                sourceWindow.recycle();
+            }
+
+            // If the user is nudging off the edge of the screen, execute the off-screen nudge
+            // action, if specified.
             handleOffScreenNudge(direction);
             return;
         }
@@ -1615,7 +1653,7 @@ public class RotaryService extends AccessibilityService implements
     private boolean handleAppSpecificOffScreenNudge(@View.FocusRealDirection int direction) {
         Bundle metaData = getForegroundActivityMetaData();
         if (metaData == null) {
-            L.w("Failed to get metadata for " + mForegroundActivity);
+            L.v("No metadata for " + mForegroundActivity);
             return false;
         }
         String directionString = DIRECTION_TO_STRING.get(direction);
