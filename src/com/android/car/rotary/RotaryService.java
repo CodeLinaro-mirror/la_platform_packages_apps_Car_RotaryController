@@ -1158,6 +1158,10 @@ public class RotaryService extends AccessibilityService implements
             return;
         }
 
+        // A view was clicked via touch screen. Exit rotary mode in case the touch overlay
+        // doesn't kick in.
+        setInRotaryMode(false);
+
         // Update mLastTouchedNode if the clicked view can take focus. If a view can't take focus,
         // performing focus action on it or calling focusSearch() on it will fail.
         if (!sourceNode.equals(mLastTouchedNode) && Utils.canTakeFocus(sourceNode)) {
