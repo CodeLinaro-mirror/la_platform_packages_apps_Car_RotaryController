@@ -16,6 +16,7 @@
 package com.android.car.rotary;
 
 import static android.accessibilityservice.AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
+import static android.car.settings.CarSettings.Secure.KEY_ROTARY_KEY_EVENT_FILTER;
 import static android.provider.Settings.Secure.DEFAULT_INPUT_METHOD;
 import static android.provider.Settings.Secure.DISABLED_SYSTEM_INPUT_METHODS;
 import static android.provider.Settings.Secure.ENABLED_INPUT_METHODS;
@@ -45,6 +46,7 @@ import static android.view.accessibility.AccessibilityNodeInfo.AccessibilityActi
 import static android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION;
 import static android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD;
 
+import static com.android.car.ui.utils.RotaryConstants.ACTION_DISMISS_POPUP_WINDOW;
 import static com.android.car.ui.utils.RotaryConstants.ACTION_HIDE_IME;
 import static com.android.car.ui.utils.RotaryConstants.ACTION_NUDGE_SHORTCUT;
 import static com.android.car.ui.utils.RotaryConstants.ACTION_NUDGE_TO_ANOTHER_FOCUS_AREA;
@@ -320,6 +322,9 @@ public class RotaryService extends AccessibilityService implements
     /** Observer to update {@link #mTouchInputMethod} when the user switches IMEs. */
     private ContentObserver mInputMethodObserver;
 
+    /** Observer to update service info when the developer toggles key event filtering. */
+    private ContentObserver mKeyEventFilterObserver;
+
     private SharedPreferences mPrefs;
     private UserManager mUserManager;
 
@@ -439,6 +444,11 @@ public class RotaryService extends AccessibilityService implements
      */
     @Nullable private Context mWindowContext;
 
+    /**
+     * Mapping from test keycodes to production keycodes. During development, you can use a USB
+     * keyboard as a stand-in for rotary hardware. To enable this: {@code adb shell settings put
+     * secure android.car.ROTARY_KEY_EVENT_FILTER 1}.
+     */
     private static final Map<Integer, Integer> TEST_TO_REAL_KEYCODE_MAP;
 
     private static final Map<Integer, Integer> DIRECTION_TO_KEYCODE_MAP;
@@ -574,6 +584,7 @@ public class RotaryService extends AccessibilityService implements
 
     @Override
     public void onCreate() {
+        L.v("onCreate");
         super.onCreate();
         Resources res = getResources();
         mRotationAcceleration3xMs = res.getInteger(R.integer.rotation_acceleration_3x_ms);
@@ -673,6 +684,7 @@ public class RotaryService extends AccessibilityService implements
 
     @Override
     public void onServiceConnected() {
+        L.v("onServiceConnected");
         super.onServiceConnected();
 
         mCar = Car.createCar(this, null, Car.CAR_WAIT_TIMEOUT_WAIT_FOREVER,
@@ -688,12 +700,7 @@ public class RotaryService extends AccessibilityService implements
                     }
                 });
 
-        if (Build.IS_DEBUGGABLE) {
-            AccessibilityServiceInfo serviceInfo = getServiceInfo();
-            // Filter testing KeyEvents from a keyboard.
-            serviceInfo.flags |= FLAG_REQUEST_FILTER_KEY_EVENTS;
-            setServiceInfo(serviceInfo);
-        }
+        updateServiceInfo();
 
         mInputManager = getSystemService(InputManager.class);
 
@@ -702,6 +709,10 @@ public class RotaryService extends AccessibilityService implements
 
         // Register an observer to update mTouchInputMethod whenever the user switches IMEs.
         registerInputMethodObserver();
+
+        // Register an observer to update the service info when the developer changes the filter
+        // setting.
+        registerFilterObserver();
     }
 
     @Override
@@ -711,10 +722,12 @@ public class RotaryService extends AccessibilityService implements
 
     @Override
     public void onDestroy() {
+        L.v("onDestroy");
         unregisterReceiver(mAppInstallUninstallReceiver);
         getWindowContext().unregisterReceiver(mHomeButtonReceiver);
 
         unregisterInputMethodObserver();
+        unregisterFilterObserver();
         if (mCarInputManager != null) {
             mCarInputManager.releaseInputEventCapture(CarInputManager.TARGET_DISPLAY_TYPE_MAIN);
         }
@@ -795,6 +808,7 @@ public class RotaryService extends AccessibilityService implements
      */
     @Override
     protected boolean onKeyEvent(KeyEvent event) {
+        L.v("onKeyEvent " + event);
         if (Build.IS_DEBUGGABLE) {
             return handleKeyEvent(event);
         }
@@ -809,9 +823,11 @@ public class RotaryService extends AccessibilityService implements
     @Override
     public void onKeyEvents(int targetDisplayId, List<KeyEvent> events) {
         if (!isValidDisplayId(targetDisplayId)) {
+            L.w("Invalid display ID " + targetDisplayId);
             return;
         }
         for (KeyEvent event : events) {
+            L.v("onKeyEvents " + event);
             handleKeyEvent(event);
         }
     }
@@ -823,9 +839,11 @@ public class RotaryService extends AccessibilityService implements
     @Override
     public void onRotaryEvents(int targetDisplayId, List<RotaryEvent> events) {
         if (!isValidDisplayId(targetDisplayId)) {
+            L.w("Invalid display ID " + targetDisplayId);
             return;
         }
         for (RotaryEvent rotaryEvent : events) {
+            L.v("onRotaryEvents " + rotaryEvent);
             handleRotaryEvent(rotaryEvent);
         }
     }
@@ -905,6 +923,30 @@ public class RotaryService extends AccessibilityService implements
     }
 
     /**
+     * Updates this accessibility service's info, enabling or disabling key event filtering
+     * depending on a setting.
+     */
+    private void updateServiceInfo() {
+        AccessibilityServiceInfo serviceInfo = getServiceInfo();
+        if (serviceInfo == null) {
+            L.w("Service info not available");
+            return;
+        }
+        int flags = serviceInfo.flags;
+        boolean filterKeyEvents = Settings.Secure.getInt(getContentResolver(),
+                KEY_ROTARY_KEY_EVENT_FILTER, /* def= */ 0) != 0;
+        if (filterKeyEvents) {
+            flags |= FLAG_REQUEST_FILTER_KEY_EVENTS;
+        } else {
+            flags &= ~FLAG_REQUEST_FILTER_KEY_EVENTS;
+        }
+        if (flags == serviceInfo.flags) return;
+        L.d((filterKeyEvents ? "Enabling" : "Disabling") + " key event filtering");
+        serviceInfo.flags = flags;
+        setServiceInfo(serviceInfo);
+    }
+
+    /**
      * Registers an observer to updates {@link #mTouchInputMethod} whenever the user switches IMEs.
      */
     private void registerInputMethodObserver() {
@@ -938,6 +980,34 @@ public class RotaryService extends AccessibilityService implements
         if (mInputMethodObserver != null) {
             getContentResolver().unregisterContentObserver(mInputMethodObserver);
             mInputMethodObserver = null;
+        }
+    }
+
+    /**
+     * Registers an observer to update our accessibility service info whenever the developer changes
+     * the key event filter setting.
+     */
+    private void registerFilterObserver() {
+        if (mKeyEventFilterObserver != null) {
+            throw new IllegalStateException("Filter observer already registered");
+        }
+        mKeyEventFilterObserver = new ContentObserver(new Handler(Looper.myLooper())) {
+            @Override
+            public void onChange(boolean selfChange) {
+                updateServiceInfo();
+            }
+        };
+        getContentResolver().registerContentObserver(
+                Settings.Secure.getUriFor(KEY_ROTARY_KEY_EVENT_FILTER),
+                /* notifyForDescendants= */ false,
+                mKeyEventFilterObserver);
+    }
+
+    /** Unregisters the observer registered by {@link #registerFilterObserver}. */
+    private void unregisterFilterObserver() {
+        if (mKeyEventFilterObserver != null) {
+            getContentResolver().unregisterContentObserver(mKeyEventFilterObserver);
+            mKeyEventFilterObserver = null;
         }
     }
 
@@ -1087,6 +1157,10 @@ public class RotaryService extends AccessibilityService implements
             }
             return;
         }
+
+        // A view was clicked via touch screen. Exit rotary mode in case the touch overlay
+        // doesn't kick in.
+        setInRotaryMode(false);
 
         // Update mLastTouchedNode if the clicked view can take focus. If a view can't take focus,
         // performing focus action on it or calling focusSearch() on it will fail.
@@ -1425,17 +1499,18 @@ public class RotaryService extends AccessibilityService implements
     @VisibleForTesting
     void nudgeTo(@NonNull List<AccessibilityWindowInfo> windows,
             @View.FocusRealDirection int direction) {
-        // If there is no non-FocusParkingView focused, execute the off-screen nudge action, if
-        // specified.
-        if (mFocusedNode == null) {
-            handleOffScreenNudge(direction);
-            return;
-        }
-
         // If the HUN is in the nudge direction, nudge to it.
         boolean hunFocusResult = focusHunsWindow(windows, direction);
         if (hunFocusResult) {
             L.d("Nudge to HUN successful");
+            return;
+        }
+
+        // If there is no non-FocusParkingView focused, execute the off-screen nudge action, if
+        // specified.
+        if (mFocusedNode == null) {
+            L.d("mFocusedNode is null");
+            handleOffScreenNudge(direction);
             return;
         }
 
@@ -1475,9 +1550,37 @@ public class RotaryService extends AccessibilityService implements
         AccessibilityNodeInfo targetFocusArea =
                 mNavigator.findNudgeTargetFocusArea(windows, mFocusedNode, mFocusArea, direction);
 
-        // If the user is nudging off the edge of the screen, execute the off-screen nudge action,
-        // if specified.
         if (targetFocusArea == null) {
+            L.d("Failed to find nearest FocusArea for nudge");
+
+            // If the user is nudging out of a dismissible popup window, perform
+            // ACTION_DISMISS_POPUP_WINDOW to dismiss it.
+            AccessibilityWindowInfo sourceWindow = mFocusArea.getWindow();
+            if (sourceWindow != null) {
+                Rect sourceBounds = new Rect();
+                sourceWindow.getBoundsInScreen(sourceBounds);
+                if (mNavigator.isDismissible(sourceWindow, sourceBounds, direction)) {
+                    AccessibilityNodeInfo fpv = mNavigator.findFocusParkingView(mFocusedNode);
+                    if (fpv != null) {
+                        if (fpv.performAction(ACTION_DISMISS_POPUP_WINDOW)) {
+                            L.v("Performed ACTION_DISMISS_POPUP_WINDOW successfully");
+                            fpv.recycle();
+                            sourceWindow.recycle();
+                            return;
+                        } else {
+                            L.v("The overlay window doesn't support dismissing by nudging "
+                                    + sourceBounds);
+                        }
+                        fpv.recycle();
+                    } else {
+                        L.e("No FocusParkingView in " + sourceWindow);
+                    }
+                }
+                sourceWindow.recycle();
+            }
+
+            // If the user is nudging off the edge of the screen, execute the off-screen nudge
+            // action, if specified.
             handleOffScreenNudge(direction);
             return;
         }
@@ -1554,7 +1657,7 @@ public class RotaryService extends AccessibilityService implements
     private boolean handleAppSpecificOffScreenNudge(@View.FocusRealDirection int direction) {
         Bundle metaData = getForegroundActivityMetaData();
         if (metaData == null) {
-            L.w("Failed to get metadata for " + mForegroundActivity);
+            L.v("No metadata for " + mForegroundActivity);
             return false;
         }
         String directionString = DIRECTION_TO_STRING.get(direction);
