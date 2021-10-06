@@ -16,14 +16,15 @@
 package com.android.car.rotary;
 
 import static android.app.ActivityTaskManager.INVALID_TASK_ID;
+import static android.view.View.FOCUS_DOWN;
+import static android.view.View.FOCUS_LEFT;
+import static android.view.View.FOCUS_RIGHT;
+import static android.view.View.FOCUS_UP;
 import static android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_BACKWARD;
 import static android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_FORWARD;
 import static android.view.accessibility.AccessibilityNodeInfo.FOCUS_INPUT;
 import static android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION;
 import static android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD;
-
-import static com.android.car.internal.ExcludeFromCodeCoverageGeneratedReport.BOILERPLATE_CODE;
-import static com.android.car.internal.ExcludeFromCodeCoverageGeneratedReport.DUMP_INFO;
 
 import android.content.pm.PackageManager;
 import android.graphics.Rect;
@@ -36,7 +37,6 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 
-import com.android.car.internal.ExcludeFromCodeCoverageGeneratedReport;
 import com.android.car.ui.FocusArea;
 import com.android.car.ui.FocusParkingView;
 import com.android.internal.util.dump.DualDumpOutputStream;
@@ -77,7 +77,7 @@ class Navigator {
             boolean showHunOnBottom) {
         mHunLeft = hunLeft;
         mHunRight = hunRight;
-        mHunNudgeDirection = showHunOnBottom ? View.FOCUS_DOWN : View.FOCUS_UP;
+        mHunNudgeDirection = showHunOnBottom ? FOCUS_DOWN : FOCUS_UP;
         mAppWindowBounds = new Rect(0, 0, displayWidth, displayHeight);
     }
 
@@ -524,25 +524,16 @@ class Navigator {
             boolean isSourceNodeEditable) {
         Rect sourceBounds = new Rect();
         source.getBoundsInScreen(sourceBounds);
-
-        // If the source window is an application window on the default display and it's smaller
-        // than the display, then it's either a TaskView window or an overlay window (such as a
-        // Dialog window). The ID of a TaskView task is different from the full screen application,
-        // while the ID of an overlay task is the same with the full screen application,
-        // so task ID is used to decide whether it's an overlay window.
-        // Nudging out of the overlay window is not allowed unless the source node is editable
-        // and the target window is an IME window (e.g., nudging from the EditText in the Dialog
-        // to the IME is allowed, while nudging from the Button in the Dialog to the IME is not
-        // allowed).
-        boolean isSourceWindowOverlayWindow = source.getType() == TYPE_APPLICATION
-                && source.getDisplayId() == Display.DEFAULT_DISPLAY
-                && !mAppWindowBounds.equals(sourceBounds)
-                && source.getTaskId() == mAppWindowTaskId;
+        boolean isSourceWindowOverlayWindow = isOverlayWindow(source, sourceBounds);
         Rect destBounds = new Rect();
         for (AccessibilityWindowInfo window : windows) {
             if (window.equals(source)) {
                continue;
             }
+            // Nudging out of the overlay window is not allowed unless the source node is editable
+            // and the target window is an IME window. E.g., nudging from the EditText in the Dialog
+            // to the IME is allowed, while nudging from the Button in the Dialog to the IME is not
+            // allowed.
             if (isSourceWindowOverlayWindow
                     && (!isSourceNodeEditable || window.getType() != TYPE_INPUT_METHOD)) {
                 continue;
@@ -555,6 +546,48 @@ class Navigator {
                 results.add(window);
             }
         }
+    }
+
+    /**
+     * Returns whether the given {@code window} with the given {@code bounds} is an overlay window.
+     * <p>
+     * If the source window is an application window on the default display and it's smaller than
+       the display, then it's either a TaskView window or an overlay window (such as a Dialog
+       window). The ID of a TaskView task is different from the full screen application, while
+       the ID of an overlay task is the same with the full screen application, so task ID is used
+       to decide whether it's an overlay window.
+     */
+    private boolean isOverlayWindow(@NonNull AccessibilityWindowInfo window, @NonNull Rect bounds) {
+        return window.getType() == TYPE_APPLICATION
+                && window.getDisplayId() == Display.DEFAULT_DISPLAY
+                && !mAppWindowBounds.equals(bounds)
+                && window.getTaskId() == mAppWindowTaskId;
+    }
+
+    /**
+     * Returns whether nudging to the given {@code direction} can dismiss the given {@code window}
+     * with the given {@code bounds}.
+     */
+    boolean isDismissible(@NonNull AccessibilityWindowInfo window,
+            @NonNull Rect bounds,
+            @View.FocusRealDirection int direction) {
+        // Only overlay windows can be dismissed.
+        if (!isOverlayWindow(window, bounds)) {
+            return false;
+        }
+        // The window can be dismissed when part of the underlying window is not covered by it in
+        // the given direction.
+        switch (direction) {
+            case FOCUS_UP:
+                return mAppWindowBounds.top < bounds.top;
+            case FOCUS_DOWN:
+                return mAppWindowBounds.bottom > bounds.bottom;
+            case FOCUS_LEFT:
+                return mAppWindowBounds.left < bounds.left;
+            case FOCUS_RIGHT:
+                return mAppWindowBounds.right > bounds.right;
+        }
+        return false;
     }
 
     /**
@@ -952,7 +985,6 @@ class Navigator {
                 });
     }
 
-    @ExcludeFromCodeCoverageGeneratedReport(reason = DUMP_INFO)
     void dump(@NonNull DualDumpOutputStream dumpOutputStream, boolean dumpAsProto,
             @NonNull String fieldName, long fieldId) {
         long fieldToken = dumpOutputStream.start(fieldName, fieldId);
@@ -967,16 +999,15 @@ class Navigator {
         dumpOutputStream.end(fieldToken);
     }
 
-    @ExcludeFromCodeCoverageGeneratedReport(reason = BOILERPLATE_CODE)
     static String directionToString(@View.FocusRealDirection int direction) {
         switch (direction) {
-            case View.FOCUS_UP:
+            case FOCUS_UP:
                 return "FOCUS_UP";
-            case View.FOCUS_DOWN:
+            case FOCUS_DOWN:
                 return "FOCUS_DOWN";
-            case View.FOCUS_LEFT:
+            case FOCUS_LEFT:
                 return "FOCUS_LEFT";
-            case View.FOCUS_RIGHT:
+            case FOCUS_RIGHT:
                 return "FOCUS_RIGHT";
             default:
                 return "<unknown direction " + direction + ">";
