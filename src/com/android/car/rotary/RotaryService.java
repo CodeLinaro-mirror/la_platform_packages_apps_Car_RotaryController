@@ -62,6 +62,7 @@ import android.car.input.CarInputManager;
 import android.car.input.RotaryEvent;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -576,6 +577,8 @@ public class RotaryService extends AccessibilityService implements
     /** Expiration time for {@link #mPendingFocusedNode} in {@link SystemClock#uptimeMillis}. */
     private long mPendingFocusedExpirationTime;
 
+    @Nullable private ContentResolver mContentResolver;
+
     private final BroadcastReceiver mAppInstallUninstallReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -663,7 +666,7 @@ public class RotaryService extends AccessibilityService implements
         }
 
         getWindowContext().registerReceiver(mHomeButtonReceiver,
-                new IntentFilter(Intent.ACTION_CLOSE_SYSTEM_DIALOGS));
+                new IntentFilter(Intent.ACTION_CLOSE_SYSTEM_DIALOGS), Context.RECEIVER_EXPORTED);
 
         IntentFilter filter = new IntentFilter();
         filter.addAction(Intent.ACTION_PACKAGE_ADDED);
@@ -672,6 +675,13 @@ public class RotaryService extends AccessibilityService implements
         filter.addAction(Intent.ACTION_PACKAGE_REMOVED);
         filter.addDataScheme("package");
         registerReceiver(mAppInstallUninstallReceiver, filter);
+
+        if (getBaseContext() != null) {
+            mContentResolver = getContentResolver();
+        }
+        if (mContentResolver == null) {
+            L.w("ContentResolver not available");
+        }
     }
 
     /**
@@ -706,6 +716,11 @@ public class RotaryService extends AccessibilityService implements
                     if (ready) {
                         mCarInputManager =
                                 (CarInputManager) mCar.getCarManager(Car.CAR_INPUT_SERVICE);
+                        if (mCarInputManager == null) {
+                            // Do nothing if mCarInputManager is null. When it becomes not null,
+                            // this lifecycle event will be called again.
+                            return;
+                        }
                         mCarInputManager.requestInputEventCapture(
                                 CarOccupantZoneManager.DISPLAY_TYPE_MAIN,
                                 mInputTypes,
@@ -954,7 +969,10 @@ public class RotaryService extends AccessibilityService implements
             return;
         }
         int flags = serviceInfo.flags;
-        boolean filterKeyEvents = Settings.Secure.getInt(getContentResolver(),
+        if (mContentResolver == null) {
+            return;
+        }
+        boolean filterKeyEvents = Settings.Secure.getInt(mContentResolver,
                 KEY_ROTARY_KEY_EVENT_FILTER, /* def= */ 0) != 0;
         if (filterKeyEvents) {
             flags |= FLAG_REQUEST_FILTER_KEY_EVENTS;
@@ -990,7 +1008,10 @@ public class RotaryService extends AccessibilityService implements
                 }
             }
         };
-        getContentResolver().registerContentObserver(
+        if (mContentResolver == null) {
+            return;
+        }
+        mContentResolver.registerContentObserver(
                 Settings.Secure.getUriFor(DEFAULT_INPUT_METHOD),
                 /* notifyForDescendants= */ false,
                 mInputMethodObserver);
@@ -999,7 +1020,10 @@ public class RotaryService extends AccessibilityService implements
     /** Unregisters the observer registered by {@link #registerInputMethodObserver}. */
     private void unregisterInputMethodObserver() {
         if (mInputMethodObserver != null) {
-            getContentResolver().unregisterContentObserver(mInputMethodObserver);
+            if (mContentResolver == null) {
+                return;
+            }
+            mContentResolver.unregisterContentObserver(mInputMethodObserver);
             mInputMethodObserver = null;
         }
     }
@@ -1018,7 +1042,10 @@ public class RotaryService extends AccessibilityService implements
                 updateServiceInfo();
             }
         };
-        getContentResolver().registerContentObserver(
+        if (mContentResolver == null) {
+            return;
+        }
+        mContentResolver.registerContentObserver(
                 Settings.Secure.getUriFor(KEY_ROTARY_KEY_EVENT_FILTER),
                 /* notifyForDescendants= */ false,
                 mKeyEventFilterObserver);
@@ -1027,7 +1054,10 @@ public class RotaryService extends AccessibilityService implements
     /** Unregisters the observer registered by {@link #registerFilterObserver}. */
     private void unregisterFilterObserver() {
         if (mKeyEventFilterObserver != null) {
-            getContentResolver().unregisterContentObserver(mKeyEventFilterObserver);
+            if (mContentResolver == null) {
+                return;
+            }
+            mContentResolver.unregisterContentObserver(mKeyEventFilterObserver);
             mKeyEventFilterObserver = null;
         }
     }
@@ -1085,11 +1115,8 @@ public class RotaryService extends AccessibilityService implements
                 }
                 return true;
             case KeyEvent.KEYCODE_BACK:
-                if (mInDirectManipulationMode) {
-                    handleBackButtonEvent(action);
-                    return true;
-                }
-                return false;
+                handleBackButtonEvent(action);
+                return true;
             default:
                 // Do nothing
         }
@@ -1881,9 +1908,10 @@ public class RotaryService extends AccessibilityService implements
         if (!isValidAction(action)) {
             return;
         }
-        // If the focused node doesn't support rotate directly, inject Back button event, then the
-        // application will handle the injected event.
-        if (!DirectManipulationHelper.supportRotateDirectly(mFocusedNode)) {
+        // If we're not in direct manipulation mode or the focused node doesn't support rotate
+        // directly, inject Back button event; then the application will handle the injected event.
+        if (!mInDirectManipulationMode
+                || !DirectManipulationHelper.supportRotateDirectly(mFocusedNode)) {
             injectKeyEvent(KeyEvent.KEYCODE_BACK, action);
             return;
         }
@@ -2158,11 +2186,11 @@ public class RotaryService extends AccessibilityService implements
                 L.v("mFocusedNode is already focused: " + mFocusedNode);
                 return false;
             }
-            // If the focused node represents an HTML element in a WebView, we just assume the focus
-            // is already initialized here, and we'll handle it properly when the user uses the
-            // controller next time.
-            if (mNavigator.isInWebView(mFocusedNode)) {
-                L.v("mFocusedNode is in a WebView: " + mFocusedNode);
+            // If the focused node represents an HTML element in a WebView, or a Composable in a
+            // ComposeView, we just assume the focus is already initialized here, and we'll handle
+            // it properly when the user uses the controller next time.
+            if (mNavigator.isInVirtualNodeHierarchy(mFocusedNode)) {
+                L.v("mFocusedNode is in a WebView or ComposeView: " + mFocusedNode);
                 return false;
             }
         }
@@ -2258,10 +2286,10 @@ public class RotaryService extends AccessibilityService implements
         mFocusedNode = Utils.refreshNode(mFocusedNode);
         if (mFocusedNode == null
                 // No need to clear focus if mFocusedNode is not focused. However, when it's a node
-                // in a WebView, its state might not be up to date, so mFocusedNode.isFocused()
-                // may return false even if the view represented by mFocusedNode is focused.
-                // So don't check the focused state if it's in WebView.
-                || (!mFocusedNode.isFocused() && !mNavigator.isInWebView(mFocusedNode))
+                // in a WebView or ComposeView, its state might not be up to date,
+                // so mFocusedNode.isFocused() may return false even if the view represented by
+                // mFocusedNode is focused. So don't check the focused state if it's in WebView.
+                || (!mFocusedNode.isFocused() && !mNavigator.isInVirtualNodeHierarchy(mFocusedNode))
                 || (targetFocus != null
                         && mFocusedNode.getWindowId() == targetFocus.getWindowId())) {
             return;
@@ -2569,12 +2597,18 @@ public class RotaryService extends AccessibilityService implements
 
     @Nullable
     private String getCurrentIme() {
-        return Settings.Secure.getString(getContentResolver(), DEFAULT_INPUT_METHOD);
+        if (mContentResolver == null) {
+            return null;
+        }
+        return Settings.Secure.getString(mContentResolver, DEFAULT_INPUT_METHOD);
     }
 
     private void setCurrentIme(String newIme) {
+        if (mContentResolver == null) {
+            return;
+        }
         boolean result =
-                Settings.Secure.putString(getContentResolver(), DEFAULT_INPUT_METHOD, newIme);
+                Settings.Secure.putString(mContentResolver, DEFAULT_INPUT_METHOD, newIme);
         L.successOrFailure("Switching to IME: " + newIme, result);
     }
 
@@ -2623,12 +2657,13 @@ public class RotaryService extends AccessibilityService implements
             L.d("No need to focus on targetNode because it's already focused: " + targetNode);
             return true;
         }
-        boolean isInWebView = mNavigator.isInWebView(targetNode);
-        if (!Utils.isFocusArea(targetNode) && Utils.hasFocus(targetNode) && !isInWebView) {
+        boolean isInVirtualHierarchy = mNavigator.isInVirtualNodeHierarchy(targetNode);
+        if (!Utils.isFocusArea(targetNode) && Utils.hasFocus(targetNode) && !isInVirtualHierarchy) {
             // One of targetNode's descendants is already focused, so we can't perform ACTION_FOCUS
             // on targetNode directly unless it's a FocusArea. The workaround is to clear the focus
             // first (by focusing on the FocusParkingView), then focus on targetNode. The
-            // prohibition on focusing a node that has focus doesn't apply in WebViews.
+            // prohibition on focusing a node that has focus doesn't apply in WebViews or
+            // ComposeViews.
             L.d("One of targetNode's descendants is already focused: " + targetNode);
             if (!clearFocusInCurrentWindow()) {
                 return false;
@@ -2747,8 +2782,11 @@ public class RotaryService extends AccessibilityService implements
      * their subtypes and returns whether {@code componentName} is one of the IMEs.
      */
     private boolean imeSettingContains(@NonNull String settingName, @NonNull String componentName) {
+        if (mContentResolver == null) {
+            return false;
+        }
         String colonSeparatedComponentNamesWithSubtypes =
-                Settings.Secure.getString(getContentResolver(), settingName);
+                Settings.Secure.getString(mContentResolver, settingName);
         if (colonSeparatedComponentNamesWithSubtypes == null) {
             return false;
         }
